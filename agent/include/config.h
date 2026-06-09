@@ -28,4 +28,8 @@
 #define C2_AUTH_TOKEN ""
 #endif
 
+#ifndef C2_USE_HTTPS
+#define C2_USE_HTTPS 0
+#endif
+
 #endif // CONFIG_H

