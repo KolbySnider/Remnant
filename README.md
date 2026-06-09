@@ -2,13 +2,11 @@
 
 A lightweight, custom C2 framework built for educational and authorized red-team use. Consists of a Python-based server and a Windows beacon agent written in C, with support for Beacon Object Files (BOFs) executed in-process.
 
-> ⚠️ **For authorized use only.** Deploy only against systems you own or have explicit written permission to test. Unauthorized use is illegal.
-
 ---
 
 ## How It Works
 
-**Communication** is HTTP over port `8080`. All traffic is encrypted with **TEA-CTR** (Tiny Encryption Algorithm in counter mode) using an 8-byte random nonce prepended to each message. The same 16-byte key is compiled into both the server and beacon.
+**Communication** is HTTP over port `8080`. All traffic is encrypted with **ChaCha20-Poly1305 AEAD** using a per-session 32-byte key derived via ECDH. The agent performs a secure key exchange on `/register`, then encrypts all later traffic with the negotiated session key.
 
 **Agent lifecycle:**
 
@@ -54,16 +52,30 @@ This will:
 
 ### Configuration
 
-Before building, edit the defines at the top of `agent/src/beacon.c`:
+The agent uses compile-time configuration in `agent/include/config.h`. Unless you override values with `build.bat` arguments, the defaults are:
 
 ```c
-#define SERVER_IP       "127.0.0.1"   // C2 server address
-#define SERVER_PORT     8080
-#define SLEEP_BASE_MS   5000          // Check-in interval
-#define SLEEP_JITTER_MS 3000          // ± jitter
+#define C2_SERVER_IP      "127.0.0.1"
+#define C2_SERVER_PORT    8080
+#define C2_USER_AGENT     "Mozilla/5.0"
+#define C2_SLEEP_BASE_MS  5000
+#define C2_SLEEP_JITTER_MS 3000
+#define C2_AUTH_TOKEN     ""
 ```
 
-The encryption key (`ENC_KEY`) must match in both `beacon.c` and `c2server.py`.
+To override values at build time, run `agent\build.bat` with optional arguments:
+
+```bat
+build.bat <server_ip> <server_port> <user_agent> <auth_token> <sleep_base_ms> <sleep_jitter_ms>
+```
+
+For example:
+
+```bat
+build.bat 10.0.0.1 8080 "Mozilla/5.0" MyToken123 5000 3000
+```
+
+If `C2_AUTH_TOKEN` is set, the beacon sends `X-C2-Token` with `/register` and the server validates it before registering a new agent.
 
 ---
 
@@ -87,6 +99,13 @@ The server starts Flask on `0.0.0.0:8080`, restores any previously saved agent s
  12:00:00  OK    restored    <n> agent(s) from agents.json
 
  >
+```
+
+If you want the server to require agent registration authentication, set the `C2_AUTH_TOKEN` environment variable before running:
+
+```bat
+set C2_AUTH_TOKEN=MyToken123
+python c2server.py
 ```
 
 ---
