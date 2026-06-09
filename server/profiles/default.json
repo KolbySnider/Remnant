@@ -22,17 +22,18 @@
       "auth_header": "X-C2-Token"
     },
 
+    "connection": {
+      "server_ip": "127.0.0.1",
+      "server_port": 8080,
+      "use_https": false,
+      "auth_token": ""
+    },
+
     "sleep": {
       "base_ms": 5000,
       "jitter_ms": 3000,
       "randomize": true,
       "max_sleep_ms": 60000
-    },
-
-    "process": {
-      "injection_enabled": true,
-      "spawn_to": "rundll32.exe",
-      "parent_obfuscation": true
     },
 
     "logging": {

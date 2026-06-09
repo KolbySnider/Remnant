@@ -52,7 +52,7 @@ This will:
 
 ### Configuration
 
-The agent uses compile-time configuration in `agent/include/config.h`. Unless you override values with `build.bat` arguments, the defaults are:
+The agent uses compile-time configuration in `agent/include/config.h`, but the default values can also be sourced from the active C2 profile (`server/profiles/default.json`). The profile now controls the agent connection settings and HTTPS flag used during builds.
 
 ```c
 #define C2_SERVER_IP      "127.0.0.1"
@@ -61,13 +61,23 @@ The agent uses compile-time configuration in `agent/include/config.h`. Unless yo
 #define C2_SLEEP_BASE_MS  5000
 #define C2_SLEEP_JITTER_MS 3000
 #define C2_AUTH_TOKEN     ""
+#define C2_USE_HTTPS      0
 ```
 
-To override values at build time, run `agent\build.bat` with optional arguments:
+To build the agent from the active profile, run:
 
 ```bat
-build.bat <server_ip> <server_port> <user_agent> <auth_token> <sleep_base_ms> <sleep_jitter_ms>
+cd agent
+build.bat ..\server\profiles\default.json
 ```
+
+You can still override individual values with optional arguments after the profile path:
+
+```bat
+build.bat ..\server\profiles\default.json 10.0.0.1 8080 "Mozilla/5.0" MyToken123 5000 3000 1
+```
+
+Where the final `1` enables HTTPS for the built agent.
 
 For example:
 
@@ -131,6 +141,12 @@ C2 profiles control communication behavior without code recompilation. The defau
       "headers": { "Content-Type": "application/octet-stream" },
       "auth_header": "X-C2-Token"
     },
+    "connection": {
+      "server_ip": "127.0.0.1",
+      "server_port": 8080,
+      "use_https": false,
+      "auth_token": ""
+    },
     "encryption": {
       "algorithm": "ChaCha20-Poly1305",
       "key_exchange": "ECDH-P256"
@@ -140,10 +156,6 @@ C2 profiles control communication behavior without code recompilation. The defau
       "jitter_ms": 3000,
       "randomize": true,
       "max_sleep_ms": 60000
-    },
-    "process": {
-      "injection_enabled": true,
-      "spawn_to": "rundll32.exe"
     }
   }
 }
@@ -158,8 +170,8 @@ Key customization options:
 - **user_agent**: Change to match target environment (corporate proxy logs, browser versions)
 - **headers**: Add/remove HTTP headers to match legitimate traffic
 - **auth_header**: Rename the authentication header (default: `X-C2-Token`)
+- **connection**: Configure server IP, port, HTTPS usage, and registration auth token
 - **sleep**: Customize beacon check-in intervals and jitter
-- **process**: Enable/disable process injection; set default spawn-to process
 
 ---
 

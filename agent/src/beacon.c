@@ -220,7 +220,7 @@ cleanup:
 //   shared_secret  = ECDH(our_priv, peer_pub)            (32-byte X coordinate)
 //   SESSION_KEY    = SHA-256(shared_secret)[:16]          (16-byte TEA key)
 //
-// All subsequent traffic is TEA-CTR encrypted with SESSION_KEY.
+// All subsequent traffic is chacha20poly1305 encrypted with SESSION_KEY.
 // ---------------------------------------------------------------------------
 
 // Build a BCRYPT_ECCKEY_BLOB from a raw 65-byte X9.62 uncompressed point.

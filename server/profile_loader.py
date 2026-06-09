@@ -1,7 +1,7 @@
 """
 C2 Profile Loader
 Handles loading and managing C2 communication profiles (JSON).
-Profiles define HTTP headers, paths, encryption, sleep patterns, and process behavior.
+Profiles define HTTP headers, paths, encryption, sleep patterns, and connection settings.
 """
 import json
 import os
@@ -45,6 +45,22 @@ class C2Profile:
         return self.data["http"].get("auth_header", "X-C2-Token")
 
     @property
+    def server_ip(self) -> str:
+        return self.data.get("connection", {}).get("server_ip", "127.0.0.1")
+
+    @property
+    def server_port(self) -> int:
+        return self.data.get("connection", {}).get("server_port", 8080)
+
+    @property
+    def use_https(self) -> bool:
+        return self.data.get("connection", {}).get("use_https", False)
+
+    @property
+    def auth_token(self) -> str:
+        return self.data.get("connection", {}).get("auth_token", "")
+
+    @property
     def http_headers(self) -> Dict[str, str]:
         return self.data["http"].get("headers", {})
 
@@ -55,14 +71,6 @@ class C2Profile:
     @property
     def jitter_ms(self) -> int:
         return self.data["sleep"].get("jitter_ms", 3000)
-
-    @property
-    def injection_enabled(self) -> bool:
-        return self.data.get("process", {}).get("injection_enabled", False)
-
-    @property
-    def spawn_to(self) -> str:
-        return self.data.get("process", {}).get("spawn_to", "rundll32.exe")
 
     def to_dict(self) -> Dict[str, Any]:
         """Return profile as dictionary (for serialization/logging)."""
