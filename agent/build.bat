@@ -11,54 +11,24 @@ set SERVER_BOF_DIR=..\server\bofs
 if not exist "%BOF_BUILD_DIR%" mkdir "%BOF_BUILD_DIR%"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
-:: 1.1 Compile-time configuration overrides
+:: 1.1 Generate agent configuration header from profile
 set "PROFILE_FILE=%~1"
-
 if "%PROFILE_FILE%"=="" set "PROFILE_FILE=..\server\profiles\default.json"
 
-if /I "%PROFILE_FILE:~-5%"==".json" (
-    if exist "%PROFILE_FILE%" (
-        echo [*] Loading build variables from profile %PROFILE_FILE%...
-        for /f "usebackq delims=" %%i in (`python "%~dp0generate_build_config.py" "%PROFILE_FILE%"`) do call set "%%i"
-        shift
-    ) else (
-        echo [!] Profile file not found: %PROFILE_FILE%
-        echo [*] Falling back to default build values
-        set "C2_SERVER_IP=127.0.0.1"
-        set "C2_SERVER_PORT=8080"
-        set "C2_USER_AGENT=Mozilla/5.0"
-        set "C2_AUTH_TOKEN="
-        set "C2_SLEEP_BASE_MS=5000"
-        set "C2_SLEEP_JITTER_MS=3000"
-        set "C2_USE_HTTPS=0"
-    )
-) else (
-    if exist "..\server\profiles\default.json" (
-        echo [*] Loading build variables from profile ..\server\profiles\default.json...
-        for /f "usebackq delims=" %%i in (`python "%~dp0generate_build_config.py" "..\server\profiles\default.json"`) do call set "%%i"
-    ) else (
-        set "C2_SERVER_IP=127.0.0.1"
-        set "C2_SERVER_PORT=8080"
-        set "C2_USER_AGENT=Mozilla/5.0"
-        set "C2_AUTH_TOKEN="
-        set "C2_SLEEP_BASE_MS=5000"
-        set "C2_SLEEP_JITTER_MS=3000"
-        set "C2_USE_HTTPS=0"
-    )
-)
+set "AGENT_CONFIG_HEADER=%BUILD_DIR%\agent_config.h"
 
-if "%C2_SERVER_IP%"=="" set "C2_SERVER_IP=127.0.0.1"
-if "%C2_SERVER_PORT%"=="" set "C2_SERVER_PORT=8080"
-if "%C2_USER_AGENT%"=="" set "C2_USER_AGENT=Mozilla/5.0"
-if "%C2_AUTH_TOKEN%"=="" set "C2_AUTH_TOKEN="
-if "%C2_SLEEP_BASE_MS%"=="" set "C2_SLEEP_BASE_MS=5000"
-if "%C2_SLEEP_JITTER_MS%"=="" set "C2_SLEEP_JITTER_MS=3000"
-if "%C2_USE_HTTPS%"=="" set "C2_USE_HTTPS=0"
+echo [*] Generating agent configuration header from profile: %PROFILE_FILE%...
+python "%~dp0generate_build_config.py" "%PROFILE_FILE%" "%AGENT_CONFIG_HEADER%"
+if !errorlevel! neq 0 (
+    echo [!] Failed to generate agent configuration header
+    pause
+    exit /b 1
+)
 
 :: 2. Build Main Beacon Components
 echo [1/3] Compiling Beacon components...
 
-set BEACON_FLAGS=-c -O2 -I include -DBOF -DC2_SERVER_IP=\"%C2_SERVER_IP%\" -DC2_SERVER_PORT=%C2_SERVER_PORT% -DC2_USER_AGENT=\"%C2_USER_AGENT%\" -DC2_AUTH_TOKEN=\"%C2_AUTH_TOKEN%\" -DC2_SLEEP_BASE_MS=%C2_SLEEP_BASE_MS% -DC2_SLEEP_JITTER_MS=%C2_SLEEP_JITTER_MS% -DC2_USE_HTTPS=%C2_USE_HTTPS%
+set BEACON_FLAGS=-c -O2 -I include -I "%BUILD_DIR%" -DBOF
 
 echo Compiling beacon.c...
 x86_64-w64-mingw32-gcc %BEACON_FLAGS% src\beacon.c -o "%BUILD_DIR%\beacon.obj"

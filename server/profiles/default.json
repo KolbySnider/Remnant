@@ -26,7 +26,7 @@
       "server_ip": "127.0.0.1",
       "server_port": 8080,
       "use_https": false,
-      "auth_token": ""
+      "auth_token": "supersecretkey"
     },
 
     "sleep": {

@@ -8,7 +8,8 @@
 
 #include "COFFLoader.h"
 #include "beacon_compatibility.h"
-#include "config.h"
+#include "agent_config.h"  // Generated from profile.json at build time
+#include "config.h"        // Fallback defaults if agent_config.h not found
 
 // ---------------------------------------------------------------------------
 // Compile-time configuration
