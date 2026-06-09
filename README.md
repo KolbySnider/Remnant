@@ -141,16 +141,6 @@ C2 profiles control communication behavior without code recompilation. The defau
       "headers": { "Content-Type": "application/octet-stream" },
       "auth_header": "X-C2-Token"
     },
-    "connection": {
-      "server_ip": "127.0.0.1",
-      "server_port": 8080,
-      "use_https": false,
-      "auth_token": ""
-    },
-    "encryption": {
-      "algorithm": "ChaCha20-Poly1305",
-      "key_exchange": "ECDH-P256"
-    },
     "sleep": {
       "base_ms": 5000,
       "jitter_ms": 3000,
