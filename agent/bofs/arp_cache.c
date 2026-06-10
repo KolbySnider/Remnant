@@ -1,7 +1,7 @@
 #define BOF
 #include "base.c"
 #include "beacon.h"
-#include "bofdefs.h"
+#include "beacon_compatibility.h"
 #include <windows.h>
 #include <iphlpapi.h>
 

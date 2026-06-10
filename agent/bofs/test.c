@@ -1,5 +1,5 @@
 #include "base.c"
-#include "bofdefs.h"
+#include "beacon_compatibility.h"
 #include "beacon.h"
 
 

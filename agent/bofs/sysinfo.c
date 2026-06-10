@@ -1,5 +1,5 @@
 #include <windows.h>
-#include "bofdefs.h"
+#include "beacon_compatibility.h"
 #include "base.c"
 
 #ifdef BOF

