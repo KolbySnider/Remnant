@@ -39,6 +39,7 @@ DECLSPEC_IMPORT void    BeaconFormatAppend(formatp * format, char * text, int le
 DECLSPEC_IMPORT void    BeaconFormatPrintf(formatp * format, char * fmt, ...);
 DECLSPEC_IMPORT char *  BeaconFormatToString(formatp * format, int * size);
 DECLSPEC_IMPORT void    BeaconFormatInt(formatp * format, int value);
+void   BeaconFormatInt(formatp* format, int value);
 
 /* Output Functions */
 #define CALLBACK_OUTPUT      0x0

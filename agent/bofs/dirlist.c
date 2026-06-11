@@ -1,97 +1,98 @@
-#define BOF
-#include "beacon_compatibility.h"
 #include "base.c"
 
-#ifdef BOF
+/* Build a "%llu B/KB/MB/GB" string without depending on MSVCRT$sprintf
+ * (which pulls in __mingw_vsprintf — not exported by any DLL). */
+static void format_size(unsigned long long sz, char* out, int outsz) {
+    const char* unit;
+    unsigned long long v;
+    if      (sz < 1024ULL)               { v = sz;                 unit = "B";  }
+    else if (sz < 1024ULL*1024)          { v = sz / 1024ULL;       unit = "KB"; }
+    else if (sz < 1024ULL*1024*1024)     { v = sz / (1024ULL*1024);unit = "MB"; }
+    else                                  { v = sz / (1024ULL*1024*1024); unit = "GB"; }
+    /* Tiny manual itoa — avoids snprintf */
+    char digits[32]; int n = 0;
+    if (v == 0) digits[n++] = '0';
+    while (v > 0) { digits[n++] = (char)('0' + (v % 10)); v /= 10; }
+    int p = 0;
+    while (n > 0 && p < outsz - 4) out[p++] = digits[--n];
+    out[p++] = ' ';
+    while (*unit && p < outsz - 1) out[p++] = *unit++;
+    out[p] = '\0';
+}
 
-void go(char *args, int len) {
-    if (!bofstart()) {
-        return;
-    }
+void go(char* args, int len) {
+    if (!bofstart()) return;
 
     WIN32_FIND_DATAA findData;
     HANDLE hFind;
     char searchPath[MAX_PATH];
-    char *directory = ".";
-    datap parser;
+    const char* directory = ".";
 
-    if (len > 0) {
+    if (len > 0 && args && args[0]) {
+        datap parser;
         BeaconDataParse(&parser, args, len);
-        int size;
-        char *path = BeaconDataExtract(&parser, &size);
-        if (path && size > 0) {
-            directory = path;
-        }
+        int size = 0;
+        char* path = BeaconDataExtract(&parser, &size);
+        if (path && size > 0) directory = path;
     }
 
-    MSVCRT$sprintf(searchPath, "%s\\*", directory);
+    /* Build "<dir>\*" without sprintf */
+    int dlen = 0;
+    while (directory[dlen] && dlen < MAX_PATH - 3) {
+        searchPath[dlen] = directory[dlen];
+        dlen++;
+    }
+    searchPath[dlen++] = '\\';
+    searchPath[dlen++] = '*';
+    searchPath[dlen]   = '\0';
 
-    internal_printf("\n=== DIRECTORY LISTING: %s ===\n\n", directory);
-    internal_printf("%-40s %12s %s\n", "Name", "Size", "Type");
-    internal_printf("%-40s %12s %s\n", "----", "----", "----");
+    BeaconPrintf(CALLBACK_OUTPUT, "\n=== DIRECTORY LISTING: %s ===\n\n", directory);
+    BeaconPrintf(CALLBACK_OUTPUT, "%-40s %12s %s\n", "Name", "Size", "Type");
+    BeaconPrintf(CALLBACK_OUTPUT, "%-40s %12s %s\n", "----", "----", "----");
 
     hFind = KERNEL32$FindFirstFileA(searchPath, &findData);
     if (hFind == INVALID_HANDLE_VALUE) {
-        internal_printf("[!] Failed to open directory (Error: %d)\n", KERNEL32$GetLastError());
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] FindFirstFile failed (err %lu)\n",
+                     KERNEL32$GetLastError());
         printoutput(TRUE);
+        bofstop();
         return;
     }
 
     int count = 0;
     do {
-        if (MSVCRT$strcmp(findData.cFileName, ".") == 0 || MSVCRT$strcmp(findData.cFileName, "..") == 0) {
+        if (MSVCRT$strcmp(findData.cFileName, ".") == 0 ||
+            MSVCRT$strcmp(findData.cFileName, "..") == 0)
             continue;
-        }
 
-        char *type = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "<DIR>" : "";
-        char attributes[10] = {0};
-
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) MSVCRT$strcat(attributes, "H");
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) MSVCRT$strcat(attributes, "S");
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_READONLY) MSVCRT$strcat(attributes, "R");
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE) MSVCRT$strcat(attributes, "A");
+        const char* type = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                           ? "<DIR>" : "";
+        char attr[8] = {0};
+        int  a = 0;
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)   attr[a++] = 'H';
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)   attr[a++] = 'S';
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_READONLY) attr[a++] = 'R';
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE)  attr[a++] = 'A';
+        attr[a] = '\0';
 
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            internal_printf("%-40s %12s %s %s\n",
-                            findData.cFileName, "", type, attributes);
+            BeaconPrintf(CALLBACK_OUTPUT, "%-40s %12s %s %s\n",
+                         findData.cFileName, "", type, attr);
         } else {
             ULARGE_INTEGER fileSize;
-            fileSize.LowPart = findData.nFileSizeLow;
+            fileSize.LowPart  = findData.nFileSizeLow;
             fileSize.HighPart = findData.nFileSizeHigh;
-
             char sizeStr[32];
-            if (fileSize.QuadPart < 1024)
-                MSVCRT$sprintf(sizeStr, "%llu B", fileSize.QuadPart);
-            else if (fileSize.QuadPart < 1024*1024)
-                MSVCRT$sprintf(sizeStr, "%llu KB", fileSize.QuadPart/1024);
-            else if (fileSize.QuadPart < 1024*1024*1024)
-                MSVCRT$sprintf(sizeStr, "%llu MB", fileSize.QuadPart/(1024*1024));
-            else
-                MSVCRT$sprintf(sizeStr, "%llu GB", fileSize.QuadPart/(1024*1024*1024));
-
-            internal_printf("%-40s %12s %s %s\n",
-                            findData.cFileName, sizeStr, type, attributes);
+            format_size(fileSize.QuadPart, sizeStr, sizeof(sizeStr));
+            BeaconPrintf(CALLBACK_OUTPUT, "%-40s %12s %s %s\n",
+                         findData.cFileName, sizeStr, type, attr);
         }
         count++;
     } while (KERNEL32$FindNextFileA(hFind, &findData));
 
     KERNEL32$FindClose(hFind);
-    internal_printf("\nTotal items: %d\n", count);
-    internal_printf("\n=== END ===\n");
+    BeaconPrintf(CALLBACK_OUTPUT, "\nTotal items: %d\n", count);
+    BeaconPrintf(CALLBACK_OUTPUT, "\n=== END ===\n");
     printoutput(TRUE);
+    bofstop();
 }
-
-#else
-
-int main(int argc, char **argv) {
-    // Optional: pass directory as command line argument
-    if (argc > 1) {
-        go(argv[1], (int)strlen(argv[1]) + 1);
-    } else {
-        char dummy[] = "";
-        go(dummy, 0);
-    }
-    return 0;
-}
-
-#endif

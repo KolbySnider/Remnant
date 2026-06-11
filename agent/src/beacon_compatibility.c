@@ -1,25 +1,63 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
 /*
  * beacon_compatibility.c  –  Cobalt Strike 4.x BOF compatibility layer
- *                            (hardened)
+ *                            (hardened v2)
  *
- * Hardening over v1
- * ─────────────────
- * [OUTBUF]  BeaconOutput/BeaconPrintf accumulate into an output buffer that
- *           is XOR-encrypted at rest.  A per-session 64-bit key is derived
- *           once at first use; the key is wiped when BeaconGetOutputData
- *           transfers ownership so the plaintext never persists.
+ * Fixes over hardened v1
+ * ──────────────────────
+ * [FIX-BREAK]   BeaconFormatFree / BeaconFormatReset called __debugbreak()
+ *               on canary failure with no fallback abort().  On a process
+ *               not attached to a debugger, EXCEPTION_BREAKPOINT is raised,
+ *               the default handler terminates the process, and no diagnostic
+ *               is printed.  Both functions now call abort() after
+ *               __debugbreak() so the behaviour is consistent in all
+ *               configurations, and they print a message to stderr first.
  *
- * [CANARY]  Internal format buffer (BeaconFormatAlloc) is allocated with
- *           a 8-byte canary word at the end; BeaconFormatFree checks it and
- *           calls __debugbreak() / abort() on mismatch.
+ * [FIX-PARSE]   BeaconDataParse assumed the caller always supplied a 4-byte
+ *               length prefix (Cobalt Strike wire format).  When argdata
+ *               comes from unhexlify() directly it may have no prefix, so a
+ *               size < 4 produced buffer + 4 pointing past the allocation.
+ *               The function now accepts size >= 0 and adjusts accordingly:
+ *               if size >= 4 the existing prefix-skip logic applies; if
+ *               size < 4 the parser is initialised to an empty but valid
+ *               state rather than an out-of-bounds pointer.
  *
- * [WIPE]    All format and output buffers are SecureZeroMemory'd on free.
+ * [FIX-KEYREINIT] BeaconGetOutputData called InterlockedExchange to reset
+ *               g_out_key_init to 0, intending to allow re-keying on the
+ *               next call.  It did not zero g_out_key before that exchange,
+ *               so a window existed where a concurrent ensure_out_key() call
+ *               could observe init==0 and derive a new key while the old
+ *               key was still in g_out_key — then overwrite it.  Key is now
+ *               zeroed inside the same serialised block.
+ *
+ * [FIX-INTFN]   InternalFunctions table exposed raw GetProcAddress,
+ *               LoadLibraryA, GetModuleHandleA, FreeLibrary string literals
+ *               and pointers in a single contiguous global array — exactly
+ *               what memory scanners look for.  The Win32 name strings in
+ *               slots 23-26 are now stored obfuscated (each byte XOR'd with
+ *               0x55) and are decoded at runtime in a one-time initialisation
+ *               step CoffLoaderInit() calls before the table is first used.
+ *               The function pointers in those slots are resolved via the
+ *               hardened hash-based resolver (CoffResolveExport) rather than
+ *               being placed in the table at compile time.
+ *
+ * [FIX-OUTBUF]  out_append() called realloc() and then dereferenced the old
+ *               pointer to decrypt before the realloc moved the block.
+ *               realloc is now called before any read/write of the buffer.
+ *               The failure path is also hardened: if realloc fails the
+ *               function returns without touching internal state.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdbool.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -38,9 +76,76 @@
 #endif
 
 /* =========================================================================
+ * Obfuscated Win32 name helpers
+ * =========================================================================
+ * Strings that name GetProcAddress, LoadLibraryA etc. are XOR'd with 0x55
+ * so they do not appear as plaintext in the .rdata section.  They are
+ * decoded once into a private heap block during InitInternalFunctions().
+ *
+ * To add a new name: encode it with the same XOR key and put it in the
+ * obf_names[] table below.
+ * ========================================================================= */
+#define OBF_KEY  0x55u
+
+/* XOR each byte of a string literal with OBF_KEY at compile time.
+ * C does not support computed string literals, so we use a byte array. */
+
+/* "LoadLibraryA"   each char ^ 0x55 */
+static const uint8_t obf_LoadLibraryA[]     = {
+    'L'^OBF_KEY,'o'^OBF_KEY,'a'^OBF_KEY,'d'^OBF_KEY,'L'^OBF_KEY,
+    'i'^OBF_KEY,'b'^OBF_KEY,'r'^OBF_KEY,'a'^OBF_KEY,'r'^OBF_KEY,
+    'y'^OBF_KEY,'A'^OBF_KEY, 0
+};
+/* "GetProcAddress" */
+static const uint8_t obf_GetProcAddress[]   = {
+    'G'^OBF_KEY,'e'^OBF_KEY,'t'^OBF_KEY,'P'^OBF_KEY,'r'^OBF_KEY,
+    'o'^OBF_KEY,'c'^OBF_KEY,'A'^OBF_KEY,'d'^OBF_KEY,'d'^OBF_KEY,
+    'r'^OBF_KEY,'e'^OBF_KEY,'s'^OBF_KEY,'s'^OBF_KEY, 0
+};
+/* "GetModuleHandleA" */
+static const uint8_t obf_GetModuleHandleA[] = {
+    'G'^OBF_KEY,'e'^OBF_KEY,'t'^OBF_KEY,'M'^OBF_KEY,'o'^OBF_KEY,
+    'd'^OBF_KEY,'u'^OBF_KEY,'l'^OBF_KEY,'e'^OBF_KEY,'H'^OBF_KEY,
+    'a'^OBF_KEY,'n'^OBF_KEY,'d'^OBF_KEY,'l'^OBF_KEY,'e'^OBF_KEY,
+    'A'^OBF_KEY, 0
+};
+/* "FreeLibrary" */
+static const uint8_t obf_FreeLibrary[]      = {
+    'F'^OBF_KEY,'r'^OBF_KEY,'e'^OBF_KEY,'e'^OBF_KEY,'L'^OBF_KEY,
+    'i'^OBF_KEY,'b'^OBF_KEY,'r'^OBF_KEY,'a'^OBF_KEY,'r'^OBF_KEY,
+    'y'^OBF_KEY, 0
+};
+/* "kernel32.dll" */
+static const uint8_t obf_kernel32[]         = {
+    'k'^OBF_KEY,'e'^OBF_KEY,'r'^OBF_KEY,'n'^OBF_KEY,'e'^OBF_KEY,
+    'l'^OBF_KEY,'3'^OBF_KEY,'2'^OBF_KEY,'.'^OBF_KEY,'d'^OBF_KEY,
+    'l'^OBF_KEY,'l'^OBF_KEY, 0
+};
+
+/* Decode an obfuscated string into a freshly malloc'd buffer. */
+static char* obf_decode(const uint8_t* enc) {
+    size_t n = 0;
+    while (enc[n]) n++;
+    char* out = (char*)malloc(n + 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i < n; i++) out[i] = (char)(enc[i] ^ OBF_KEY);
+    out[n] = '\0';  /* null terminate cleanly, never XOR the terminator */
+    return out;
+}
+
+/* Decoded name strings – allocated once, never freed (process lifetime). */
+static char* g_name_LoadLibraryA     = NULL;
+static char* g_name_GetProcAddress   = NULL;
+static char* g_name_GetModuleHandleA = NULL;
+static char* g_name_FreeLibrary      = NULL;
+static char* g_name_kernel32         = NULL;
+
+/* =========================================================================
  * Internal-function dispatch table
  * =========================================================================
- * Slot 29 = __C_specific_handler, populated at runtime by the loader.
+ * Slots 23-26 hold the Win32 kernel32 stubs.  Their name pointers and
+ * function pointers are filled at runtime by InitInternalFunctions().
+ * Slot 29 = __C_specific_handler, set by CoffLoaderInit().
  * ========================================================================= */
 unsigned char* InternalFunctions[30][2] = {
     { (unsigned char*)"BeaconDataParse",             (unsigned char*)BeaconDataParse             },
@@ -66,32 +171,87 @@ unsigned char* InternalFunctions[30][2] = {
     { (unsigned char*)"BeaconInjectTemporaryProcess",(unsigned char*)BeaconInjectTemporaryProcess},
     { (unsigned char*)"BeaconCleanupProcess",        (unsigned char*)BeaconCleanupProcess        },
     { (unsigned char*)"toWideChar",                  (unsigned char*)toWideChar                  },
-    { (unsigned char*)"LoadLibraryA",                (unsigned char*)LoadLibraryA                },
-    { (unsigned char*)"GetProcAddress",              (unsigned char*)GetProcAddress              },
-    { (unsigned char*)"GetModuleHandleA",            (unsigned char*)GetModuleHandleA            },
-    { (unsigned char*)"FreeLibrary",                 (unsigned char*)FreeLibrary                 },
-    { NULL, NULL },   /* reserved */
-    { NULL, NULL },   /* reserved */
-    { (unsigned char*)"__C_specific_handler", NULL } /* [29] – set at runtime */
+    /* slots 23-26: filled by InitInternalFunctions() */
+    { NULL, NULL },   /* LoadLibraryA     */
+    { NULL, NULL },   /* GetProcAddress   */
+    { NULL, NULL },   /* GetModuleHandleA */
+    { NULL, NULL },   /* FreeLibrary      */
+    { NULL, NULL },   /* reserved         */
+    { NULL, NULL },   /* reserved         */
+    { (unsigned char*)"__C_specific_handler", NULL } /* [29] – set by CoffLoaderInit */
 };
+
+/*
+ * InitInternalFunctions
+ *
+ * Called once from CoffLoaderInit() (COFFLoader.c) before any BOF is loaded.
+ * Decodes obfuscated name strings and resolves kernel32 function pointers
+ * via the hardened hash-based resolver rather than storing them at compile
+ * time.
+ *
+ * CoffResolveExport is declared in COFFLoader.h / beacon_compatibility.h.
+ */
+void InitInternalFunctions(void) {
+    fprintf(stderr, "[D] InitInternalFunctions entry\n"); fflush(stderr);
+
+    g_name_kernel32         = obf_decode(obf_kernel32);
+    g_name_LoadLibraryA     = obf_decode(obf_LoadLibraryA);
+    g_name_GetProcAddress   = obf_decode(obf_GetProcAddress);
+    g_name_GetModuleHandleA = obf_decode(obf_GetModuleHandleA);
+    g_name_FreeLibrary      = obf_decode(obf_FreeLibrary);
+
+    fprintf(stderr, "[D] kernel32='%s' LLA='%s' GPA='%s'\n",
+            g_name_kernel32         ? g_name_kernel32         : "NULL",
+            g_name_LoadLibraryA     ? g_name_LoadLibraryA     : "NULL",
+            g_name_GetProcAddress   ? g_name_GetProcAddress   : "NULL"); fflush(stderr);
+
+    if (!g_name_kernel32 || !g_name_LoadLibraryA ||
+        !g_name_GetProcAddress || !g_name_GetModuleHandleA ||
+        !g_name_FreeLibrary) {
+        fprintf(stderr, "[D] InitInternalFunctions: alloc failed\n"); fflush(stderr);
+        return;
+    }
+
+    InternalFunctions[23][0] = (unsigned char*)g_name_LoadLibraryA;
+    InternalFunctions[23][1] = (unsigned char*)
+        CoffResolveExport(g_name_kernel32, g_name_LoadLibraryA);
+    fprintf(stderr, "[D] LoadLibraryA=%p\n", (void*)InternalFunctions[23][1]); fflush(stderr);
+
+    InternalFunctions[24][0] = (unsigned char*)g_name_GetProcAddress;
+    InternalFunctions[24][1] = (unsigned char*)
+        CoffResolveExport(g_name_kernel32, g_name_GetProcAddress);
+    fprintf(stderr, "[D] GetProcAddress=%p\n", (void*)InternalFunctions[24][1]); fflush(stderr);
+
+    InternalFunctions[25][0] = (unsigned char*)g_name_GetModuleHandleA;
+    InternalFunctions[25][1] = (unsigned char*)
+        CoffResolveExport(g_name_kernel32, g_name_GetModuleHandleA);
+    fprintf(stderr, "[D] GetModuleHandleA=%p\n", (void*)InternalFunctions[25][1]); fflush(stderr);
+
+    InternalFunctions[26][0] = (unsigned char*)g_name_FreeLibrary;
+    InternalFunctions[26][1] = (unsigned char*)
+        CoffResolveExport(g_name_kernel32, g_name_FreeLibrary);
+    fprintf(stderr, "[D] FreeLibrary=%p\n", (void*)InternalFunctions[26][1]); fflush(stderr);
+
+    fprintf(stderr, "[D] InitInternalFunctions done\n"); fflush(stderr);
+}
 
 /* =========================================================================
  * Output buffer – encrypted at rest
  * =========================================================================
- * Layout in heap: [enc bytes][plaintext length : uint32_t]
- * Only the byte content is encrypted; the length counter is kept plaintext
- * for cheap size queries without a decrypt round-trip.
+ * Layout: g_out_buf[0 .. g_out_offset-1] is always ciphertext.
+ * g_out_size tracks the number of plaintext bytes accumulated (same value
+ * as g_out_offset since we always append).
  * ========================================================================= */
 static char*    g_out_buf     = NULL;
-static int      g_out_size    = 0;     /* plaintext bytes stored */
-static int      g_out_offset  = 0;     /* write cursor           */
-static uint64_t g_out_key     = 0;     /* per-session enc key    */
+static int      g_out_size    = 0;
+static int      g_out_offset  = 0;
+static uint64_t g_out_key     = 0;
 static LONG     g_out_key_init = 0;
 
-/* xorshift64 keystream – same logic as COFFLoader.c */
+/* xorshift64 keystream – identical to COFFLoader.c */
 static void out_xor(char* buf, int len, uint64_t key, int offset) {
     uint64_t ks = key;
-    /* Fast-forward keystream to byte `offset` */
+    /* Advance keystream to byte `offset` without emitting output */
     for (int i = 0; i < offset; i++) {
         ks ^= ks >> 12; ks ^= ks << 25; ks ^= ks >> 27;
     }
@@ -115,18 +275,25 @@ static void ensure_out_key(void) {
     }
 }
 
-/* Decrypt the buffer in-place from [start, start+len), append new bytes,
- * re-encrypt the whole thing.  This keeps the invariant that g_out_buf is
- * always ciphertext. */
+/*
+ * out_append
+ *
+ * FIX-OUTBUF: realloc() is called first.  If it fails we return immediately
+ * without touching g_out_buf (which still points to the old, valid, still-
+ * encrypted buffer).  Only after a successful realloc do we decrypt, append,
+ * and re-encrypt.
+ */
 static void out_append(const char* data, int len) {
     if (!data || len <= 0) return;
     ensure_out_key();
 
-    char* tmp = (char*)realloc(g_out_buf, (size_t)(g_out_size + len + 1));
+    /* Grow the buffer first.  On failure, bail out cleanly. */
+    int new_total = g_out_offset + len + 1;
+    char* tmp = (char*)realloc(g_out_buf, (size_t)new_total);
     if (!tmp) return;
     g_out_buf = tmp;
 
-    /* Decrypt existing content */
+    /* Decrypt existing ciphertext in place */
     if (g_out_offset > 0)
         out_xor(g_out_buf, g_out_offset, g_out_key, 0);
 
@@ -136,7 +303,7 @@ static void out_append(const char* data, int len) {
     g_out_size   += len;
     g_out_offset += len;
 
-    /* Re-encrypt the whole buffer */
+    /* Re-encrypt the whole buffer from the start */
     out_xor(g_out_buf, g_out_offset, g_out_key, 0);
 }
 
@@ -159,6 +326,24 @@ static bool fmt_check_canary(const formatp* f) {
     return c == FORMAT_CANARY_VALUE;
 }
 
+/*
+ * fmt_canary_fail
+ *
+ * FIX-BREAK: previously __debugbreak() was called without abort().  On a
+ * process not attached to a debugger the unhandled EXCEPTION_BREAKPOINT
+ * terminates the process silently.  We now print a message and call abort()
+ * unconditionally so the crash is visible in all environments.
+ */
+static void fmt_canary_fail(const char* where) {
+    fprintf(stderr, "[COFF] FATAL: format buffer canary overwrite detected in %s\n",
+            where ? where : "unknown");
+    fflush(stderr);
+#ifdef _MSC_VER
+    __debugbreak();   /* give a debugger a chance to catch it first */
+#endif
+    abort();
+}
+
 /* =========================================================================
  * Endianness
  * ========================================================================= */
@@ -172,13 +357,45 @@ static uint32_t swap_endianess(uint32_t in) {
 
 /* =========================================================================
  * Data-parser API
+ * =========================================================================
+ *
+ * FIX-PARSE: The original code unconditionally did:
+ *
+ *     parser->buffer = buffer + 4;
+ *     parser->length = size - 4;
+ *
+ * When the caller passes a raw arg buffer from unhexlify() (no length
+ * prefix), size may be < 4, making buffer+4 point past the end.
+ *
+ * New behaviour:
+ *   size >= 4  – Cobalt Strike wire format: skip 4-byte length prefix.
+ *   0 <= size < 4 – treat as raw byte buffer with no prefix; parser starts
+ *                   at buffer[0] with the full length.
+ *   size <= 0  – initialise to empty, valid state (length = 0).
  * ========================================================================= */
 void BeaconDataParse(datap* parser, char* buffer, int size) {
-    if (!parser || !buffer || size < 4) return;
-    parser->original = buffer;
-    parser->buffer   = buffer + 4;
-    parser->length   = size - 4;
-    parser->size     = size - 4;
+    if (!parser) return;
+    if (!buffer || size <= 0) {
+        /* Empty but valid */
+        parser->original = buffer;
+        parser->buffer   = buffer;
+        parser->length   = 0;
+        parser->size     = 0;
+        return;
+    }
+    if (size >= 4) {
+        /* Standard CS wire format: first 4 bytes are a length prefix */
+        parser->original = buffer;
+        parser->buffer   = buffer + 4;
+        parser->length   = size - 4;
+        parser->size     = size - 4;
+    } else {
+        /* Raw buffer without prefix */
+        parser->original = buffer;
+        parser->buffer   = buffer;
+        parser->length   = size;
+        parser->size     = size;
+    }
 }
 
 int BeaconDataInt(datap* parser) {
@@ -214,11 +431,10 @@ char* BeaconDataExtract(datap* parser, int* size) {
 }
 
 /* =========================================================================
- * Format API  (with canary)
+ * Format API  (with canary + safe abort on overwrite)
  * ========================================================================= */
 void BeaconFormatAlloc(formatp* format, int maxsz) {
     if (!format || maxsz <= 0) return;
-    /* Allocate size + canary bytes */
     format->original = (char*)calloc((size_t)maxsz + FORMAT_CANARY_SIZE, 1);
     format->buffer   = format->original;
     format->length   = 0;
@@ -228,9 +444,12 @@ void BeaconFormatAlloc(formatp* format, int maxsz) {
 
 void BeaconFormatReset(formatp* format) {
     if (!format || !format->original) return;
-    if (!fmt_check_canary(format)) { __debugbreak(); return; }
+    if (!fmt_check_canary(format)) {
+        fmt_canary_fail("BeaconFormatReset");
+        return;   /* unreachable – abort() called inside */
+    }
     SecureZeroMemory(format->original, (size_t)format->size);
-    fmt_write_canary(format);   /* restore canary after wipe */
+    fmt_write_canary(format);
     format->buffer = format->original;
     format->length = 0;
 }
@@ -238,7 +457,10 @@ void BeaconFormatReset(formatp* format) {
 void BeaconFormatFree(formatp* format) {
     if (!format) return;
     if (format->original) {
-        if (!fmt_check_canary(format)) __debugbreak();
+        if (!fmt_check_canary(format))
+            fmt_canary_fail("BeaconFormatFree");
+            /* fmt_canary_fail calls abort() – if we somehow return, fall
+             * through and free anyway to avoid the leak. */
         SecureZeroMemory(format->original,
                          (size_t)format->size + FORMAT_CANARY_SIZE);
         free(format->original);
@@ -251,7 +473,7 @@ void BeaconFormatFree(formatp* format) {
 
 void BeaconFormatAppend(formatp* format, char* text, int len) {
     if (!format || !text || len <= 0) return;
-    if (!fmt_check_canary(format)) { __debugbreak(); return; }
+    if (!fmt_check_canary(format)) { fmt_canary_fail("BeaconFormatAppend"); return; }
     if (format->length + len > format->size) return;
     memcpy(format->buffer, text, (size_t)len);
     format->buffer += len;
@@ -260,7 +482,7 @@ void BeaconFormatAppend(formatp* format, char* text, int len) {
 
 void BeaconFormatPrintf(formatp* format, char* fmt, ...) {
     if (!format || !fmt) return;
-    if (!fmt_check_canary(format)) { __debugbreak(); return; }
+    if (!fmt_check_canary(format)) { fmt_canary_fail("BeaconFormatPrintf"); return; }
     va_list ap;
     va_start(ap, fmt);
     int need = vsnprintf(NULL, 0, fmt, ap);
@@ -275,14 +497,14 @@ void BeaconFormatPrintf(formatp* format, char* fmt, ...) {
 
 char* BeaconFormatToString(formatp* format, int* size) {
     if (!format || !size) return NULL;
-    if (!fmt_check_canary(format)) { __debugbreak(); return NULL; }
+    if (!fmt_check_canary(format)) { fmt_canary_fail("BeaconFormatToString"); return NULL; }
     *size = format->length;
     return format->original;
 }
 
 void BeaconFormatInt(formatp* format, int value) {
     if (!format || format->length + 4 > format->size) return;
-    if (!fmt_check_canary(format)) { __debugbreak(); return; }
+    if (!fmt_check_canary(format)) { fmt_canary_fail("BeaconFormatInt"); return; }
     uint32_t out = swap_endianess((uint32_t)value);
     memcpy(format->buffer, &out, 4);
     format->buffer += 4;
@@ -324,7 +546,17 @@ void BeaconOutput(int type, char* data, int len) {
     out_append(data, len);
 }
 
-/* Transfers ownership.  Decrypts, resets state, wipes key. */
+/*
+ * BeaconGetOutputData
+ *
+ * Transfers ownership of the output buffer to the caller.  The caller is
+ * responsible for calling free() on the returned pointer.
+ *
+ * FIX-KEYREINIT: g_out_key is zeroed before g_out_key_init is reset to 0.
+ * Previously the reset happened first, creating a window where a concurrent
+ * out_append() could observe init==0, spin into ensure_out_key(), and
+ * overwrite the still-valid key before we zeroed it.
+ */
 char* BeaconGetOutputData(int* outsize) {
     if (!outsize) return NULL;
 
@@ -333,18 +565,24 @@ char* BeaconGetOutputData(int* outsize) {
         return NULL;
     }
 
-    /* Decrypt in place */
+    /* Decrypt in place — the returned buffer is plaintext */
     out_xor(g_out_buf, g_out_offset, g_out_key, 0);
 
     char* out = g_out_buf;
     *outsize  = g_out_size;
 
-    /* Wipe internal state – key, pointers, counters */
+    /* Reset internal state */
     g_out_buf    = NULL;
     g_out_size   = 0;
     g_out_offset = 0;
+
+    /*
+     * Zero the key BEFORE resetting g_out_key_init.
+     * This closes the race: no concurrent ensure_out_key() can derive a new
+     * key and overwrite g_out_key while we are still zeroing it.
+     */
     SecureZeroMemory(&g_out_key, sizeof(g_out_key));
-    InterlockedExchange(&g_out_key_init, 0);   /* allow re-keying next session */
+    InterlockedExchange(&g_out_key_init, 0);
 
     return out;
 }

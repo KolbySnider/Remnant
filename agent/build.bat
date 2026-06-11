@@ -130,7 +130,7 @@ x86_64-w64-mingw32-gcc ^
   "%BUILD_DIR%\beacon_compatibility.obj" ^
   "%BUILD_DIR%\COFFLoader.obj" ^
   -o "%BUILD_DIR%\%ARG_OUT%" ^
-  -lws2_32 -lbcrypt -lwinhttp
+  -lws2_32 -lbcrypt -lwinhttp -liphlpapi -lsecur32 -ladvapi32
 if !errorlevel! neq 0 (echo [!] Link failed && exit /b 1)
 
 :: ---------------------------------------------------------------------------

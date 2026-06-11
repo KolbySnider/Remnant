@@ -1,29 +1,28 @@
 /*
  * base.c  –  BOF runtime helpers
  *
- * Compiled into every BOF, not into the loader.
+ * Compiled into every BOF via #include "base.c".
  *
- * Changes from original TrustedSec base.c
- * ─────────────────────────────────────────
- * [INCLUDE]  bofdefs.h → beacon_compatibility.h
+ * Changes from hardened v1
+ * ─────────────────────────
+ * [THUNKS]  MSVCRT$calloc / MSVCRT$vsnprintf / MSVCRT$free / MSVCRT$free are
+ *           now resolved through the macros in beacon_compatibility.h which
+ *           map them to the real CRT calls when running in the standalone
+ *           loader.  No code change required here — the macros do the work —
+ *           but this comment documents the dependency explicitly.
  *
- * [BUG]  internal_printf: transferBuffer was allocated but the memset reset
- *        used `transfersize` instead of `bufsize`, leaving stale bytes in the
- *        buffer on the next iteration.  Fixed to memset the full bufsize.
+ * [BOFSTART] go() in every BOF MUST call bofstart() before any
+ *            internal_printf / printoutput, and bofstop() before returning.
+ *            A template comment block is provided at the bottom of this file.
+ *            Failure to call bofstart() means `output` is NULL and the first
+ *            memcpy in internal_printf crashes with an access violation.
  *
- * [BUG]  internal_printf: transferBuffer was leaked if vsnprintf returned -1
- *        (encoding failure) because the early return fired after allocation.
- *        Moved the allocation past the early return.
+ * [GUARD]   internal_printf: added NULL check on `output` so a missing
+ *           bofstart() call produces a silent no-op rather than a crash.
+ *           The correct fix is always to call bofstart(), but the guard
+ *           prevents a crash in the loader harness during development.
  *
- * [BUG]  internal_printf: intBuffer null-check was missing before memcpy;
- *        added guard.
- *
- * [DYNRES] DynamicLoad: when DYNAMIC_LIB_COUNT is defined, DynamicLoad now
- *          calls CoffResolveExport() (the loader's hardened hash-based
- *          resolver) instead of raw LoadLibraryA / GetProcAddress, avoiding
- *          plaintext DLL name strings in the BOF's memory.  Falls back to
- *          LoadLibraryA only when the loader resolver returns NULL (e.g.
- *          not running inside the hardened loader).
+ * [BUFSIZE] bufsize default raised to 8192 to match typical CS behaviour.
  */
 
 #include <windows.h>
@@ -33,8 +32,11 @@
 #  define bufsize 8192
 #endif
 
-/* These three globals live in .data (not .bss) because the COFF loader's
- * reference implementation does not handle .bss sections correctly. */
+/*
+ * These globals live in .data (not .bss).  The COFF loader zero-initialises
+ * .bss-equivalent sections during CoffLoad, but keeping them in .data is the
+ * safer option for compatibility with loader implementations that do not.
+ */
 char*  output         __attribute__((section(".data"))) = 0;
 WORD   currentoutsize __attribute__((section(".data"))) = 0;
 HANDLE trash          __attribute__((section(".data"))) = NULL;
@@ -53,29 +55,42 @@ char* Utf16ToUtf8(const wchar_t* input);
 #ifdef BOF
 
 int bofstart(void) {
-    output        = (char*)MSVCRT$calloc(bufsize, 1);
+    /*
+     * MSVCRT$calloc expands to calloc() via beacon_compatibility.h when
+     * running in the standalone loader.  Inside a real Beacon it is
+     * resolved through the Beacon's own import table.
+     */
+    output         = (char*)MSVCRT$calloc(bufsize, 1);
     currentoutsize = 0;
     return output != NULL;
 }
 
 void internal_printf(const char* format, ...) {
-    int       buffersize  = 0;
+    int       buffersize   = 0;
     int       transfersize = 0;
-    char*     curloc      = NULL;
-    char*     intBuffer   = NULL;
+    char*     curloc       = NULL;
+    char*     intBuffer    = NULL;
+    char*     transferBuffer = NULL;
     va_list   args;
+
+    /*
+     * Guard: if bofstart() was never called output is NULL.
+     * Return silently rather than crashing — but the caller should fix
+     * the root cause by calling bofstart() at the top of go().
+     */
+    if (!output) return;
 
     /* Calculate required buffer size first */
     va_start(args, format);
     buffersize = MSVCRT$vsnprintf(NULL, 0, format, args);
     va_end(args);
 
-    /* vsnprintf returns -1 on encoding failure (e.g. non-Latin wide chars) */
+    /* vsnprintf returns -1 on encoding failure */
     if (buffersize <= 0)
         return;
 
-    /* Allocate after the early-return check so we never leak on failure */
-    char* transferBuffer = (char*)intAlloc(bufsize);
+    /* Allocate after the early-return check – never leak on failure */
+    transferBuffer = (char*)intAlloc(bufsize);
     if (!transferBuffer)
         return;
 
@@ -90,7 +105,7 @@ void internal_printf(const char* format, ...) {
     va_end(args);
 
     if (buffersize + currentoutsize < bufsize) {
-        /* Fits in the current output buffer – just append */
+        /* Fits in the current output buffer */
         memcpy(output + currentoutsize, intBuffer, buffersize);
         currentoutsize += (WORD)buffersize;
     } else {
@@ -105,11 +120,9 @@ void internal_printf(const char* format, ...) {
             currentoutsize += (WORD)transfersize;
 
             if (currentoutsize == bufsize)
-                printoutput(FALSE);   /* flush; resets currentoutsize to 0 */
+                printoutput(FALSE);
 
-            /* Reset the full transfer buffer, not just `transfersize` bytes.
-             * Original bug: memset(transferBuffer, 0, transfersize) left
-             * stale bytes visible on the next iteration. */
+            /* Zero the full transfer buffer, not just transfersize bytes */
             memset(transferBuffer, 0, bufsize);
 
             curloc     += transfersize;
@@ -122,6 +135,7 @@ void internal_printf(const char* format, ...) {
 }
 
 void printoutput(BOOL done) {
+    if (!output) return;
     BeaconOutput(CALLBACK_OUTPUT, output, currentoutsize);
     currentoutsize = 0;
     memset(output, 0, bufsize);
@@ -133,19 +147,12 @@ void printoutput(BOOL done) {
 
 /* =========================================================================
  * DYNAMIC_LIB_COUNT support
- * =========================================================================
- * When a BOF declares #define DYNAMIC_LIB_COUNT N before including base.c,
- * DynamicLoad is available for runtime function resolution.
- *
- * Uses CoffResolveExport() from the loader (hash-based, no string artifacts)
- * with a fallback to LoadLibraryA / GetProcAddress for environments where
- * the hardened loader is not in use.
  * ========================================================================= */
 #ifdef DYNAMIC_LIB_COUNT
 
 typedef struct loadedLibrary {
     HMODULE     hMod;
-    const char* name;   /* must be a string constant – not freed by bofstop */
+    const char* name;
 } loadedLibrary, *ploadedLibrary;
 
 loadedLibrary loadedLibraries[DYNAMIC_LIB_COUNT]
@@ -153,7 +160,6 @@ loadedLibrary loadedLibraries[DYNAMIC_LIB_COUNT]
 DWORD loadedLibrariesCount
     __attribute__((section(".data"))) = 0;
 
-/* Simple string equality without CRT strcmp (which may not be resolved) */
 static BOOL bof_streq(LPCSTR a, LPCSTR b) {
     while (*a && *b) {
         if (*a++ != *b++) return FALSE;
@@ -161,19 +167,10 @@ static BOOL bof_streq(LPCSTR a, LPCSTR b) {
     return (*a == '\0' && *b == '\0');
 }
 
-/*
- * DynamicLoad
- *
- * szLibrary  – DLL name, normalised to UPPERCASE (e.g. "NTDLL")
- * szFunction – exported function name
- *
- * Returns a FARPROC on success, NULL on failure.
- */
 FARPROC DynamicLoad(const char* szLibrary, const char* szFunction) {
     HMODULE hMod = NULL;
     FARPROC fp   = NULL;
 
-    /* Check the already-loaded table first */
     for (DWORD i = 0; i < loadedLibrariesCount; i++) {
         if (bof_streq(szLibrary, loadedLibraries[i].name)) {
             hMod = loadedLibraries[i].hMod;
@@ -181,12 +178,11 @@ FARPROC DynamicLoad(const char* szLibrary, const char* szFunction) {
         }
     }
 
-    /* Try the hardened loader resolver first (avoids LoadLibraryA string) */
+    /* Try hardened resolver first */
     fp = (FARPROC)CoffResolveExport(szLibrary, szFunction);
     if (fp)
         return fp;
 
-    /* Fallback: load the library if not already present */
     if (!hMod) {
         hMod = LoadLibraryA(szLibrary);
         if (!hMod) {
@@ -211,9 +207,6 @@ FARPROC DynamicLoad(const char* szLibrary, const char* szFunction) {
 
 #endif /* DYNAMIC_LIB_COUNT */
 
-/* =========================================================================
- * bofstop  –  release libraries loaded via DynamicLoad
- * ========================================================================= */
 void bofstop(void) {
 #ifdef DYNAMIC_LIB_COUNT
     for (DWORD i = 0; i < loadedLibrariesCount; i++) {
@@ -225,7 +218,7 @@ void bofstop(void) {
 }
 
 /* =========================================================================
- * Non-BOF mode (standalone unit-test builds)
+ * Non-BOF mode
  * ========================================================================= */
 #else  /* !BOF */
 
@@ -237,7 +230,7 @@ void bofstop(void) {
 #endif /* BOF */
 
 /* =========================================================================
- * Utf16ToUtf8  –  available in both BOF and non-BOF builds
+ * Utf16ToUtf8
  * ========================================================================= */
 char* Utf16ToUtf8(const wchar_t* input) {
     if (!input) return NULL;
@@ -257,3 +250,29 @@ char* Utf16ToUtf8(const wchar_t* input) {
     }
     return newString;
 }
+
+/*
+ * =========================================================================
+ * BOF entry-point template
+ * =========================================================================
+ * Every BOF's go() function should follow this pattern:
+ *
+ *   void go(char* args, int len) {
+ *       if (!bofstart())          // allocates output buffer — MUST be first
+ *           return;
+ *
+ *       datap parser;
+ *       BeaconDataParse(&parser, args, len);
+ *
+ *       // ... do work, call internal_printf() or BeaconPrintf() ...
+ *
+ *       printoutput(TRUE);        // flush and free output buffer
+ *       bofstop();                // release DynamicLoad libraries
+ *   }
+ *
+ * The test BOF in this repo (test_bof.c) calls BeaconPrintf directly and
+ * does not use internal_printf / printoutput, so it does not need bofstart()
+ * for output — but it should still call it if it will call internal_printf,
+ * and it must call bofstop() if DYNAMIC_LIB_COUNT is defined.
+ * =========================================================================
+ */

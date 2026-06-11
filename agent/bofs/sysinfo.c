@@ -1,86 +1,36 @@
-#include <windows.h>
-#include "beacon_compatibility.h"
 #include "base.c"
 
-#ifdef BOF
-VOID go(
-	IN PCHAR Buffer,
-	IN ULONG Length
-)
-{
-	if(!bofstart())
-	{
-		return;
-	}
+void go(char* args, int len) {
+    if (!bofstart()) return;
 
-	/* ---------- buffers ---------- */
-	WCHAR wComputer[256];
-	char  computer[256];
-	char  username[256];
+    WCHAR wComputer[256];
+    char  computer[256];
+    char  username[256];
+    DWORD sizeW = 256;
+    DWORD sizeA = sizeof(username);
+    MEMORYSTATUSEX mem;
 
-	DWORD sizeW;
-	DWORD sizeA;
+    BeaconPrintf(CALLBACK_OUTPUT, "\n=== SYSTEM INFORMATION ===\n\n");
 
-	SYSTEM_INFO si;
-	OSVERSIONINFOA osvi;
-	MEMORYSTATUSEX mem;
+    if (KERNEL32$GetComputerNameExW(ComputerNameNetBIOS, wComputer, &sizeW)) {
+        Kernel32$WideCharToMultiByte(CP_ACP, 0, wComputer, -1,
+                                      computer, sizeof(computer), NULL, NULL);
+        BeaconPrintf(CALLBACK_OUTPUT, "Computer Name: %s\n", computer);
+    }
 
-	internal_printf("\n=== SYSTEM INFORMATION ===\n\n");
+    if (SECUR32$GetUserNameExA(NameSamCompatible, username, &sizeA)) {
+        BeaconPrintf(CALLBACK_OUTPUT, "Username: %s\n", username);
+    }
 
-	/* ---------- Computer Name ---------- */
-	sizeW = 256;
+    mem.dwLength = sizeof(MEMORYSTATUSEX);
+    if (KERNEL32$GlobalMemoryStatusEx(&mem)) {
+        BeaconPrintf(CALLBACK_OUTPUT, "Total RAM: %.2f GB\n",
+                     (double)mem.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
+        BeaconPrintf(CALLBACK_OUTPUT, "Available RAM: %.2f GB\n",
+                     (double)mem.ullAvailPhys / (1024.0 * 1024.0 * 1024.0));
+    }
 
-	if (KERNEL32$GetComputerNameExW(
-			ComputerNameNetBIOS,
-			wComputer,
-			&sizeW))
-	{
-		Kernel32$WideCharToMultiByte(
-			CP_ACP,
-			0,
-			wComputer,
-			-1,
-			computer,
-			sizeof(computer),
-			NULL,
-			NULL
-		);
-
-		internal_printf("Computer Name: %s\n", computer);
-	}
-
-	/* ---------- Username ---------- */
-	sizeA = sizeof(username);
-
-	if (SECUR32$GetUserNameExA(NameSamCompatible, username, &sizeA))
-	{
-		internal_printf("Username: %s\n", username);
-	}
-
-	/* ---------- Memory ---------- */
-	mem.dwLength = sizeof(MEMORYSTATUSEX);
-
-	if (KERNEL32$GlobalMemoryStatusEx(&mem))
-	{
-		internal_printf(
-			"Total RAM: %.2f GB\n",
-			(double)mem.ullTotalPhys / (1024.0 * 1024.0 * 1024.0)
-		);
-
-		internal_printf(
-			"Available RAM: %.2f GB\n",
-			(double)mem.ullAvailPhys / (1024.0 * 1024.0 * 1024.0)
-		);
-	}
-
-	internal_printf("\n=== END ===\n");
-
-	printoutput(TRUE);
+    BeaconPrintf(CALLBACK_OUTPUT, "\n=== END ===\n");
+    printoutput(TRUE);
+    bofstop();
 }
-#else
-int main()
-{
-	//code for standalone exe for scanbuild / leak checks
-	return 0;
-}
-#endif

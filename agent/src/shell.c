@@ -20,15 +20,23 @@ static int   beacon_buf_pos = 0;
 static int   beacon_buf_cap = 0;
 static char  cwd[MAX_PATH]  = {0};
 
+ 
 int shell_init(void) {
-    if (CoffLoaderInit() != COFF_SUCCESS) return -1;  // add this
-
+    fprintf(stderr, "[D] shell_init entry\n"); fflush(stderr);
+    fprintf(stderr, "[D] calling CoffLoaderInit\n"); fflush(stderr);
+    coff_error_t ci = CoffLoaderInit();
+    fprintf(stderr, "[D] CoffLoaderInit = %d\n", ci); fflush(stderr);
+    if (ci != COFF_SUCCESS) return -1;
+    fprintf(stderr, "[D] calloc\n"); fflush(stderr);
     beacon_buf = calloc(OUTPUT_BUF_SIZE, 1);
+    fprintf(stderr, "[D] calloc done %p\n", (void*)beacon_buf); fflush(stderr);
     if (!beacon_buf) return -1;
     beacon_buf_cap = OUTPUT_BUF_SIZE;
     GetCurrentDirectoryA(MAX_PATH, cwd);
+    fprintf(stderr, "[D] shell_init done\n"); fflush(stderr);
     return 0;
 }
+
 
 void shell_cleanup(void) {
     free(beacon_buf);

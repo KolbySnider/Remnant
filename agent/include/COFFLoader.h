@@ -130,11 +130,21 @@ typedef struct coff_sym {
 /* -----------------------------------------------------------------
  * Symbol storage classes
  * ----------------------------------------------------------------- */
-#define IMAGE_SYM_CLASS_EXTERNAL     0x02
-#define IMAGE_SYM_CLASS_STATIC       0x03
-#define IMAGE_SYM_CLASS_EXTERNAL_DEF 0x05
-#define IMAGE_SYM_CLASS_LABEL        0x06
-#define IMAGE_SYM_CLASS_SECTION      0x68
+#ifndef IMAGE_SYM_CLASS_EXTERNAL
+#  define IMAGE_SYM_CLASS_EXTERNAL     0x02
+#endif
+#ifndef IMAGE_SYM_CLASS_STATIC
+#  define IMAGE_SYM_CLASS_STATIC       0x03
+#endif
+#ifndef IMAGE_SYM_CLASS_EXTERNAL_DEF
+#  define IMAGE_SYM_CLASS_EXTERNAL_DEF 0x05
+#endif
+#ifndef IMAGE_SYM_CLASS_LABEL
+#  define IMAGE_SYM_CLASS_LABEL        0x06
+#endif
+#ifndef IMAGE_SYM_CLASS_SECTION
+#  define IMAGE_SYM_CLASS_SECTION 0x0068
+#endif
 
 /* -----------------------------------------------------------------
  * Error codes

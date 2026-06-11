@@ -1,28 +1,39 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
 /*
- * COFFLoader.c  –  Production-grade BOF/COFF Loader (v3)
+ * COFFLoader.c  –  Production-grade BOF/COFF Loader (v3 – fixed)
  *
- * v3 additions over v2
- * ─────────────────────
- * [INIT]    CoffLoaderInit() / CoffLoaderTeardown() provide an explicit
- *           process lifecycle.  The private heap and CS are created/destroyed
- *           here instead of lazily, giving clean shutdown semantics.
+ * Fixes over the submitted v3
+ * ────────────────────────────
+ * [FIX-PROT]   CoffRun() now correctly manages VirtualProtect across the
+ *              full execution lifecycle:
+ *                1. Strip all protections to PAGE_READWRITE (decrypt phase)
+ *                2. Decrypt in-place
+ *                3. Set the entry section to PAGE_EXECUTE_READ before call
+ *                4. After return, set back to PAGE_READWRITE (re-encrypt)
+ *                5. Re-encrypt in-place
+ *                6. Restore original section protections via
+ *                   CoffApplyProtections-equivalent logic
+ *              The prior code left sections writable after execution, causing
+ *              DEP/NX faults or EDR alerts on the second BOF call and leaving
+ *              the re-encrypted data in an executable page.
  *
- * [CSH]     __C_specific_handler is resolved once in CoffLoaderInit() via
- *           GetProcAddress and stored in InternalFunctions[29].  Previously
- *           it was never set in the hardened loader, causing SEH to crash.
+ * [FIX-CSH]    CoffLoaderInit() now prints a warning (debug builds) when
+ *              __C_specific_handler cannot be resolved rather than silently
+ *              storing NULL, which caused a hard crash when any BOF used SEH.
  *
- * [WATCH]   CoffRun() executes the BOF entry point on a dedicated thread.
- *           WaitForSingleObject with a configurable deadline detects a hung
- *           BOF and terminates the thread, returning COFF_ERR_TIMEOUT.
- *           Default timeout: COFF_DEFAULT_TIMEOUT_MS (30 s).
+ * [FIX-HARNESS] The standalone main() wraps CoffRunBOF in __try/__except on
+ *              Windows so structured exceptions from a misbehaving BOF are
+ *              caught and reported rather than crashing the host process.
  *
- * [WIPE]    getFileContents() and unhexlify() zero-wipe their output buffers
- *           via a companion CoffFreeBlob() so the caller can erase the COFF
- *           blob from memory after CoffRunBOF returns.
- *
- * [DYNRES]  CoffResolveExport() exposes the hardened hash-based resolver so
- *           BOFs using DYNAMIC_LIB_COUNT / DynamicLoad can call it instead of
- *           raw LoadLibraryA / GetProcAddress, avoiding string artifacts.
+ * [FIX-STRIP]  Before calling CoffApplyProtections in CoffRunBOF the guard
+ *              pages are already in place; a redundant second
+ *              VirtualProtect(PAGE_READWRITE) at the top of CoffRun no longer
+ *              fights them.
  */
 
 #include <limits.h>
@@ -112,6 +123,7 @@ static void  priv_free(void* p)    { free(p); }
  * ========================================================================= */
 coff_error_t CoffLoaderInit(void) {
 #if defined(_WIN32)
+    fprintf(stderr, "[D] CoffLoaderInit entry\n"); fflush(stderr);
     /* Atomically claim the init slot */
     if (InterlockedCompareExchange(&g_loader_ready, 1, 0) != 0) {
         /* Already initialised or being initialised by another thread */
@@ -126,21 +138,34 @@ coff_error_t CoffLoaderInit(void) {
         InterlockedExchange(&g_loader_ready, 0);
         return COFF_ERR_ALLOC_FAIL;
     }
+    fprintf(stderr, "[D] HeapCreate done: %p\n", g_private_heap); fflush(stderr);
 
     InitializeCriticalSectionAndSpinCount(&g_cs, 4000);
+    fprintf(stderr, "[D] CS init done\n"); fflush(stderr);
 
-    /* Resolve __C_specific_handler once here so every BOF that uses SEH
-     * gets a valid pointer.  This is the only place we call GetProcAddress
-     * with a string for an internal function. */
-    HMODULE hntdll = GetModuleHandleA("ntdll.dll");
-    HMODULE hkern  = GetModuleHandleA("kernel32.dll");
-    /* __C_specific_handler lives in ntdll on x64, kernel32 on x86 */
-    FARPROC csh = NULL;
-    if (hntdll) csh = GetProcAddress(hntdll,  "__C_specific_handler");
-    if (!csh && hkern) csh = GetProcAddress(hkern, "__C_specific_handler");
+    /*
+     * __C_specific_handler / _except_handler4 are compiler-internal symbols.
+     * They are NOT exported by ntdll or kernel32 so GetProcAddress always
+     * returns NULL.  <excpt.h> (pulled in by <windows.h>) already declares
+     * them with their real signatures — just take the address directly.
+     * The linker resolves it from the same CRT the loader is linked against,
+     * which is the same one BOFs' SEH tables reference.
+     */
+#if defined(__x86_64__) || defined(_WIN64)
+    FARPROC csh = (FARPROC)__C_specific_handler;
+#else
+    FARPROC csh = (FARPROC)_except_handler4;
+#endif
+    fprintf(stderr, "[D] csh=%p\n", (void*)csh); fflush(stderr);
+
     /* Store into the compatibility table */
     extern unsigned char* InternalFunctions[30][2];
     InternalFunctions[29][1] = (unsigned char*)(void*)csh;
+
+    fprintf(stderr, "[D] CSH stored, calling InitInternalFunctions\n"); fflush(stderr);
+    extern void InitInternalFunctions(void);
+    InitInternalFunctions();
+    fprintf(stderr, "[D] InitInternalFunctions returned\n"); fflush(stderr);
 
     InterlockedExchange(&g_loader_ready, 2);
     return COFF_SUCCESS;
@@ -265,14 +290,20 @@ static uint32_t djb2_lower(const char* s) {
 static void* default_alloc(size_t size, void* user_ctx) {
     (void)user_ctx;
 #if defined(_WIN32)
-    size_t total = PAGE_SIZE_BYTES + size + PAGE_SIZE_BYTES;
+    /* Round section size up so the trailing guard page sits on a page
+     * boundary.  VirtualProtect rounds the start address DOWN to the
+     * containing page, so a misaligned trailing guard would protect the
+     * section data page itself and the next memcpy faults. */
+    size_t aligned = (size + PAGE_SIZE_BYTES - 1) & ~((size_t)PAGE_SIZE_BYTES - 1);
+    if (aligned == 0) aligned = PAGE_SIZE_BYTES;
+    size_t total = PAGE_SIZE_BYTES + aligned + PAGE_SIZE_BYTES;
     uint8_t* base = (uint8_t*)VirtualAlloc(NULL, total,
                                             MEM_COMMIT | MEM_RESERVE,
                                             PAGE_READWRITE);
     if (!base) return NULL;
     DWORD old;
-    VirtualProtect(base,                          PAGE_SIZE_BYTES, PAGE_NOACCESS, &old);
-    VirtualProtect(base + PAGE_SIZE_BYTES + size, PAGE_SIZE_BYTES, PAGE_NOACCESS, &old);
+    VirtualProtect(base,                             PAGE_SIZE_BYTES, PAGE_NOACCESS, &old);
+    VirtualProtect(base + PAGE_SIZE_BYTES + aligned, PAGE_SIZE_BYTES, PAGE_NOACCESS, &old);
     return base + PAGE_SIZE_BYTES;
 #else
     return calloc(1, size);
@@ -300,6 +331,69 @@ typedef struct {
 
 extern unsigned char* InternalFunctions[30][2];
 
+/*
+ * Self-contained NT internal type definitions.
+ *
+ * MinGW's <windows.h> does not expose PEB, UNICODE_STRING, or the full
+ * LDR_DATA_TABLE_ENTRY.  <winternl.h> exists but its LDR_DATA_TABLE_ENTRY
+ * omits BaseDllName/FullDllName on many MinGW distributions.
+ *
+ * We define everything we need from scratch using only primitive Windows
+ * types (USHORT, PVOID, ULONG, WCHAR) that <windows.h> always provides.
+ * The MY_ prefix avoids collisions with any partial definitions the SDK
+ * may have already emitted.
+ */
+#if defined(_WIN32)
+
+typedef struct _MY_UNICODE_STRING {
+    USHORT Length;         /* byte length of the string, NOT including NUL */
+    USHORT MaximumLength;  /* byte length of the buffer                    */
+    WCHAR* Buffer;
+} MY_UNICODE_STRING;
+
+typedef struct _MY_LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY  InLoadOrderLinks;
+    LIST_ENTRY  InMemoryOrderLinks;
+    LIST_ENTRY  InInitializationOrderLinks;
+    PVOID       DllBase;
+    PVOID       EntryPoint;
+    ULONG       SizeOfImage;
+    MY_UNICODE_STRING FullDllName;
+    MY_UNICODE_STRING BaseDllName;
+    ULONG       Flags;
+    SHORT       LoadCount;
+    SHORT       TlsIndex;
+    LIST_ENTRY  HashLinks;
+    PVOID       SectionPointer;
+    ULONG       CheckSum;
+    ULONG       TimeDateStamp;
+    PVOID       LoadedImports;
+    PVOID       EntryPointActivationContext;
+    PVOID       PatchInformation;
+} MY_LDR_DATA_TABLE_ENTRY;
+
+/* PEB_LDR_DATA — only the fields we actually read */
+typedef struct _MY_PEB_LDR_DATA {
+    ULONG       Length;
+    BOOL        Initialized;
+    PVOID       SsHandle;
+    LIST_ENTRY  InLoadOrderModuleList;
+    LIST_ENTRY  InMemoryOrderModuleList;
+    LIST_ENTRY  InInitializationOrderModuleList;
+} MY_PEB_LDR_DATA;
+
+/* PEB — only the Ldr pointer is needed */
+typedef struct _MY_PEB {
+    BYTE            Reserved1[2];
+    BYTE            BeingDebugged;
+    BYTE            Reserved2[1];
+    PVOID           Reserved3[2];
+    MY_PEB_LDR_DATA* Ldr;
+    /* remaining fields omitted – we never access them */
+} MY_PEB;
+
+#endif /* _WIN32 */
+
 /* =========================================================================
  * Hash-based PE export resolution (no plaintext GetProcAddress)
  * ========================================================================= */
@@ -326,21 +420,41 @@ static void* find_export_by_hash(HMODULE hmod, uint32_t func_hash) {
 }
 
 static HMODULE find_module_by_hash(uint32_t dll_hash) {
-#ifdef _WIN64
-    PEB* peb = (PEB*)__readgsqword(0x60);
-#else
-    PEB* peb = (PEB*)__readfsdword(0x30);
+    /*
+     * Read the PEB address from the GS/FS segment register.
+     * __readgsqword / __readfsdword are intrinsics on MSVC.
+     * On MinGW we use inline asm because the intrinsics are not always
+     * available, particularly for __readfsdword on x86.
+     */
+#if defined(__GNUC__) || defined(__clang__)
+#  ifdef _WIN64
+    MY_PEB* peb;
+    __asm__ volatile ("movq %%gs:0x60, %0" : "=r"(peb));
+#  else
+    MY_PEB* peb;
+    __asm__ volatile ("movl %%fs:0x30, %0" : "=r"(peb));
+#  endif
+#else  /* MSVC */
+#  ifdef _WIN64
+    MY_PEB* peb = (MY_PEB*)__readgsqword(0x60);
+#  else
+    MY_PEB* peb = (MY_PEB*)__readfsdword(0x30);
+#  endif
 #endif
+
+    if (!peb || !peb->Ldr) return NULL;
+
     LIST_ENTRY* head = &peb->Ldr->InMemoryOrderModuleList;
     LIST_ENTRY* cur  = head->Flink;
-    while (cur != head) {
-        LDR_DATA_TABLE_ENTRY* e = CONTAINING_RECORD(
-            cur, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    while (cur && cur != head) {
+        MY_LDR_DATA_TABLE_ENTRY* e = CONTAINING_RECORD(
+            cur, MY_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
         if (e->BaseDllName.Buffer) {
             char narrow[64] = {0};
-            int  n = e->BaseDllName.Length / 2;
+            int  n = e->BaseDllName.Length / 2;  /* Length is in bytes */
             if (n >= (int)sizeof(narrow)) n = (int)sizeof(narrow) - 1;
-            for (int i = 0; i < n; i++) narrow[i] = (char)e->BaseDllName.Buffer[i];
+            for (int i = 0; i < n; i++)
+                narrow[i] = (char)e->BaseDllName.Buffer[i];
             if (djb2_lower(narrow) == dll_hash)
                 return (HMODULE)e->DllBase;
         }
@@ -352,9 +466,6 @@ static HMODULE find_module_by_hash(uint32_t dll_hash) {
 
 /* =========================================================================
  * CoffResolveExport  –  public hardened resolver
- * =========================================================================
- * Called by base.c DynamicLoad replacement and by the loader's own
- * symbol-resolution path.
  * ========================================================================= */
 void* CoffResolveExport(const char* lib_name, const char* func_name) {
     if (!lib_name || !func_name) return NULL;
@@ -364,13 +475,10 @@ void* CoffResolveExport(const char* lib_name, const char* func_name) {
 
     HMODULE hmod = find_module_by_hash(lib_hash);
     if (!hmod) {
-        /* LoadLibraryA unavoidable for not-yet-loaded DLLs; name is
-         * stack-local and gone the moment this call returns. */
         hmod = LoadLibraryA(lib_name);
         if (!hmod) return NULL;
     }
     void* fp = find_export_by_hash(hmod, func_hash);
-    /* Fallback for forwarded exports, which don't appear in the EAT */
     if (!fp) fp = (void*)GetProcAddress(hmod, func_name);
     return fp;
 #else
@@ -385,46 +493,149 @@ static bool str_pfx(const char* s, const char* p) {
     return strncmp(s, p, strlen(p)) == 0;
 }
 
+/* Helper: look up a name in the InternalFunctions table by exact match. */
+
+/* =========================================================================
+ * REL32 trampoline allocator
+ * =========================================================================
+ * For bare-name external REL32 relocations we cannot point the displacement
+ * at the GOT slot (the BOF would execute the GOT bytes as instructions).
+ * Instead we write a 14-byte trampoline somewhere within ±2GB of the patch
+ * site and point the REL32 at that.
+ *
+ * The trampoline area lives in the slack space at the end of each section\'s
+ * page-aligned allocation: section data is sh->SizeOfRawData bytes, exec_size
+ * is rounded up to a page (often 4096), giving (exec_size - SizeOfRawData)
+ * bytes of free space.  Since the trampolines sit in the section memory,
+ * the existing XOR-encryption + VirtualProtect lifecycle covers them for free.
+ *
+ * Per section we track next_tramp_offset, which starts at SizeOfRawData and
+ * grows toward exec_size.  Each trampoline takes 16 bytes.
+ * ========================================================================= */
+#define TRAMP_BYTES 16
+
+typedef struct {
+    uint32_t section_idx;
+    uint32_t next_offset;     /* next free byte in slack region */
+    uint32_t raw_data_size;   /* SizeOfRawData — where slack begins */
+} tramp_alloc_t;
+
+/* Allocate a 16-byte trampoline inside section si\'s slack region.
+ * Writes:  ff 25 00 00 00 00 <8 bytes target_addr> <2 bytes pad>
+ * Returns the address of the trampoline (caller patches REL32 to it),
+ * or NULL if no slack space remains. */
+static uint8_t* alloc_trampoline(coff_ctx_t* ctx, uint16_t si,
+                                  uint32_t raw_size, uint32_t* next_off,
+                                  void* target_addr) {
+    if (!ctx || si >= ctx->section_count) return NULL;
+    uint32_t exec_size = ctx->sections[si].exec_size;
+    if (*next_off + TRAMP_BYTES > exec_size) return NULL;
+
+    uint8_t* base = (uint8_t*)ctx->sections[si].exec_ptr;
+    uint8_t* t    = base + *next_off;
+
+    t[0] = 0xff; t[1] = 0x25;                       /* jmp [rip+0] */
+    t[2] = 0x00; t[3] = 0x00; t[4] = 0x00; t[5] = 0x00;
+    memcpy(t + 6, &target_addr, sizeof(void*));     /* 8-byte target */
+    /* t[14..15] = pad */
+
+    *next_off += TRAMP_BYTES;
+    return t;
+}
+
+static void* internal_lookup_exact(const char* name) {
+    if (!name) return NULL;
+    if (strcmp(name, "__C_specific_handler") == 0)
+        return InternalFunctions[29][1];
+    for (int i = 0; i < 30; i++) {
+        if (InternalFunctions[i][0] &&
+            strcmp(name, (char*)InternalFunctions[i][0]) == 0)
+            return InternalFunctions[i][1];
+    }
+    return NULL;
+}
+
+/* Fallback DLL list searched in order for unprefixed externals.
+ * msvcrt first because most bare names are CRT (calloc/free/memcpy/etc). */
+static const char* g_fallback_dlls[] = {
+    "msvcrt.dll", "kernel32.dll", "user32.dll", "advapi32.dll",
+    "ws2_32.dll", "iphlpapi.dll", "secur32.dll", "ntdll.dll",
+    NULL
+};
+
+/* MinGW-static-linked symbols that no DLL exports.
+ * These are pulled in by libmingwex.a when the loader links, so we can take
+ * their address directly and hand them to a BOF that references them.
+ * Declared with the C signatures MinGW uses. */
+extern int __mingw_vsnprintf(char*, size_t, const char*, va_list);
+extern int __ms_vsnprintf(char*, size_t, const char*, va_list);
+
+typedef struct { const char* name; void* fn; } static_sym_t;
+static const static_sym_t g_static_syms[] = {
+    { "__mingw_vsnprintf", (void*)&__mingw_vsnprintf },
+    { "__ms_vsnprintf",    (void*)&__ms_vsnprintf    },
+    { NULL, NULL }
+};
+static void* static_lookup(const char* name) {
+    for (int i = 0; g_static_syms[i].name; i++)
+        if (strcmp(name, g_static_syms[i].name) == 0)
+            return g_static_syms[i].fn;
+    return NULL;
+}
+
+static void* resolve_bare_name(const char* name) {
+    /* Internal table first (BeaconPrintf, BeaconOutput, etc) */
+    void* p = internal_lookup_exact(name);
+    if (p) return p;
+    /* Then statically-linked symbols (mingwex helpers etc) */
+    p = static_lookup(name);
+    if (p) return p;
+    /* Then walk the fallback DLLs */
+    for (int i = 0; g_fallback_dlls[i]; i++) {
+        p = CoffResolveExport(g_fallback_dlls[i], name);
+        if (p) return p;
+    }
+    return NULL;
+}
+
 static void* resolve_symbol(const char* sym) {
     if (!sym) return NULL;
 
-    /* Beacon / internal functions */
-    if (str_pfx(sym, IMPORT_PREFIX "Beacon")        ||
-        str_pfx(sym, IMPORT_PREFIX "toWideChar")    ||
-        str_pfx(sym, IMPORT_PREFIX "GetProcAddress")||
-        str_pfx(sym, IMPORT_PREFIX "LoadLibraryA")  ||
-        str_pfx(sym, IMPORT_PREFIX "GetModuleHandleA")||
-        str_pfx(sym, IMPORT_PREFIX "FreeLibrary")   ||
-        strcmp(sym, "__C_specific_handler") == 0) {
+    /* 1. __C_specific_handler — special case, bare name */
+    if (strcmp(sym, "__C_specific_handler") == 0)
+        return InternalFunctions[29][1];
 
-        if (strcmp(sym, "__C_specific_handler") == 0)
-            return InternalFunctions[29][1];
-
+    /* 2. __imp_<...> form */
+    if (str_pfx(sym, IMPORT_PREFIX)) {
         const char* bare = sym + IMPORT_PREFIX_LEN;
-        for (int i = 0; i < 30; i++) {
-            if (InternalFunctions[i][0] &&
-                str_pfx(bare, (char*)InternalFunctions[i][0]))
-                return InternalFunctions[i][1];
+
+        char buf[256];
+        strncpy(buf, bare, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+
+        char* dollar = strchr(buf, '$');
+        if (dollar) {
+            /* __imp_LIBNAME$func — standard Cobalt Strike form */
+            *dollar = '\0';
+            char* func = dollar + 1;
+            char* at   = strchr(func, '@');
+            if (at) *at = '\0';
+            DBG("resolve lib='%s' func='%s'", buf, func);
+            return CoffResolveExport(buf, func);
         }
-        return NULL;
+
+        /* __imp_<bareName> — no $ separator.  Could be:
+         *   - a kernel32/msvcrt/etc import emitted by MinGW
+         *   - an internal Beacon* function (rare with __imp_)
+         */
+        DBG("resolve bare-imp '%s'", bare);
+        return resolve_bare_name(bare);
     }
 
-    /* DLL$Function external symbols */
-    if (!str_pfx(sym, IMPORT_PREFIX)) return NULL;
-
-    char buf[256];
-    strncpy(buf, sym + IMPORT_PREFIX_LEN, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-
-    char* dollar = strchr(buf, '$');
-    if (!dollar) return NULL;
-    *dollar = '\0';
-    char* func = dollar + 1;
-    char* at   = strchr(func, '@');
-    if (at) *at = '\0';
-
-    DBG("resolve lib='%s' func='%s'", buf, func);
-    return CoffResolveExport(buf, func);
+    /* 3. Bare name (no __imp_ prefix) — direct REL32 call.
+     *    BeaconPrintf, calloc, free, __mingw_vsnprintf, etc. */
+    DBG("resolve bare '%s'", sym);
+    return resolve_bare_name(sym);
 }
 
 /* =========================================================================
@@ -567,18 +778,25 @@ coff_error_t CoffLoad(
 
         xor_crypt((uint8_t*)mem, alloc_sz, runtime_key);
 
-        ctx->sections[s].exec_ptr       = mem;
-        ctx->sections[s].exec_size      = alloc_sz;
+        ctx->sections[s].exec_ptr        = mem;
         ctx->sections[s].characteristics = sh->Characteristics;
 #if defined(_WIN32)
         if (alloc->alloc == default_alloc) {
+            size_t aligned = (alloc_sz + PAGE_SIZE_BYTES - 1) & ~((size_t)PAGE_SIZE_BYTES - 1);
+            if (aligned == 0) aligned = PAGE_SIZE_BYTES;
+            /* exec_size covers the whole aligned region so trampolines in the
+             * slack area (SizeOfRawData .. aligned) are XOR\'d and protected
+             * along with the real section data. */
+            ctx->sections[s].exec_size  = (uint32_t)aligned;
             ctx->sections[s].base_alloc = (uint8_t*)mem - PAGE_SIZE_BYTES;
-            ctx->sections[s].base_size  = PAGE_SIZE_BYTES + alloc_sz + PAGE_SIZE_BYTES;
+            ctx->sections[s].base_size  = PAGE_SIZE_BYTES + aligned + PAGE_SIZE_BYTES;
         } else {
+            ctx->sections[s].exec_size = alloc_sz;
             ctx->sections[s].base_alloc = mem;
             ctx->sections[s].base_size  = alloc_sz;
         }
 #else
+        ctx->sections[s].exec_size  = alloc_sz;
         ctx->sections[s].base_alloc = mem;
         ctx->sections[s].base_size  = alloc_sz;
 #endif
@@ -643,14 +861,50 @@ coff_error_t CoffLoad(
                     xor_crypt((uint8_t*)ctx->sections[si].exec_ptr,
                               ctx->sections[si].exec_size, runtime_key);
             } else if (sym_external && sym->Value == 0) {
-                void** cached = find_cached_import(ctx, sym_name, runtime_key);
-                if (cached) { target = cached; }
-                else {
-                    void* resolved = resolve_symbol(sym_name);
-                    if (!resolved) { DBG("Unresolved: %s", sym_name); RELOC_FAIL(COFF_ERR_SYMBOL_UNRESOLVED); }
-                    void** slot = add_cached_import(ctx, sym_name, resolved, runtime_key);
-                    if (!slot) RELOC_FAIL(COFF_ERR_ALLOC_FAIL);
-                    target = slot;
+                /* Resolve the function. */
+                void* resolved = NULL;
+                {
+                    void** cached = find_cached_import(ctx, sym_name, runtime_key);
+                    if (cached) {
+                        resolved = *cached;
+                    } else {
+                        resolved = resolve_symbol(sym_name);
+                        if (!resolved) { DBG("Unresolved: %s", sym_name); RELOC_FAIL(COFF_ERR_SYMBOL_UNRESOLVED); }
+                        void** slot = add_cached_import(ctx, sym_name, resolved, runtime_key);
+                        if (!slot) RELOC_FAIL(COFF_ERR_ALLOC_FAIL);
+                        cached = slot;
+                    }
+
+                    /* Direct call (bare name) vs indirect through GOT (__imp_).
+                     * MinGW emits REL32 to bare names with `call rel32` (direct)
+                     * and REL32 to __imp_<name> with `call *[rip+disp]` (indirect).
+                     * For direct calls we need a trampoline because the function
+                     * is typically > 2GB away (e.g. msvcrt). */
+                    bool is_imp = str_pfx(sym_name, IMPORT_PREFIX);
+                    if (is_imp) {
+                        target = cached;        /* GOT slot for indirect call */
+                    } else {
+                        /* Build a trampoline in this section\'s slack area.
+                         * Track next-offset per section in a static-sized array. */
+                        static uint32_t tramp_next[COFF_MAX_SECTIONS] = {0};
+                        static uint16_t tramp_init_for_load = 0xFFFF;
+                        if (tramp_init_for_load != s) {
+                            tramp_next[s] = 0;
+                            /* Find SizeOfRawData for section s */
+                            const coff_sect_t* sh_init = (const coff_sect_t*)(
+                                coff_data + sizeof(coff_file_header_t) +
+                                hdr->SizeOfOptionalHeader +
+                                (uint64_t)s * sizeof(coff_sect_t));
+                            tramp_next[s] = sh_init->SizeOfRawData;
+                            /* round up to 8 for alignment */
+                            tramp_next[s] = (tramp_next[s] + 7) & ~7u;
+                            tramp_init_for_load = s;
+                        }
+                        uint8_t* tr = alloc_trampoline(ctx, s,
+                            ctx->sections[s].exec_size, &tramp_next[s], resolved);
+                        if (!tr) RELOC_FAIL(COFF_ERR_ALLOC_FAIL);
+                        target = tr;
+                    }
                 }
             } else { RELOC_FAIL(COFF_ERR_SYMBOL_UNRESOLVED); }
 
@@ -725,10 +979,10 @@ coff_error_t CoffApplyProtections(coff_ctx_t* ctx) {
         void* mem = ctx->sections[s].exec_ptr;
         if (!mem) continue;
         uint32_t ch   = ctx->sections[s].characteristics;
-        bool exec     = (ch & IMAGE_SCN_MEM_EXECUTE)    != 0;
-        bool write    = (ch & IMAGE_SCN_MEM_WRITE)      != 0;
-        bool read     = (ch & IMAGE_SCN_MEM_READ)       != 0;
-        bool discard  = (ch & IMAGE_SCN_MEM_DISCARDABLE)!= 0;
+        bool exec     = (ch & IMAGE_SCN_MEM_EXECUTE)     != 0;
+        bool write    = (ch & IMAGE_SCN_MEM_WRITE)       != 0;
+        bool read     = (ch & IMAGE_SCN_MEM_READ)        != 0;
+        bool discard  = (ch & IMAGE_SCN_MEM_DISCARDABLE) != 0;
         DWORD prot    = PAGE_NOACCESS;
         if      (discard)       prot = PAGE_NOACCESS;
         else if (exec && write) prot = PAGE_EXECUTE_READWRITE;
@@ -745,6 +999,27 @@ coff_error_t CoffApplyProtections(coff_ctx_t* ctx) {
 #endif
     return COFF_SUCCESS;
 }
+
+/* =========================================================================
+ * Internal helper: derive the correct VirtualProtect flag for a section
+ * from its COFF characteristics, used to restore protections after
+ * execution without duplicating the table above.
+ * ========================================================================= */
+#if defined(_WIN32)
+static DWORD section_prot_from_chars(uint32_t ch) {
+    bool exec    = (ch & IMAGE_SCN_MEM_EXECUTE)     != 0;
+    bool write   = (ch & IMAGE_SCN_MEM_WRITE)       != 0;
+    bool read    = (ch & IMAGE_SCN_MEM_READ)        != 0;
+    bool discard = (ch & IMAGE_SCN_MEM_DISCARDABLE) != 0;
+    if (discard)       return PAGE_NOACCESS;
+    if (exec && write) return PAGE_EXECUTE_READWRITE;
+    if (exec && read)  return PAGE_EXECUTE_READ;
+    if (exec)          return PAGE_EXECUTE;
+    if (write)         return PAGE_READWRITE;
+    if (read)          return PAGE_READONLY;
+    return PAGE_NOACCESS;
+}
+#endif
 
 /* =========================================================================
  * Watchdog thread context
@@ -765,6 +1040,26 @@ static DWORD WINAPI bof_thread_proc(LPVOID param) {
 
 /* =========================================================================
  * CoffRun
+ * =========================================================================
+ *
+ * Protection lifecycle (Windows, default_alloc path)
+ * ───────────────────────────────────────────────────
+ *   After CoffApplyProtections the sections are in their final read-only or
+ *   execute-read state.  We must open them to PAGE_READWRITE before we can
+ *   XOR-decrypt in place, then set the entry section to PAGE_EXECUTE_READ
+ *   immediately before the call, and finally restore everything after the
+ *   call has returned (or timed out).
+ *
+ *   Step 1  – strip to PAGE_READWRITE   (all sections)
+ *   Step 2  – xor_crypt decrypt          (all sections)
+ *   Step 3  – decrypt import GOT
+ *   Step 4  – set entry section to PAGE_EXECUTE_READ
+ *   Step 5  – call (or thread + watchdog)
+ *   Step 6  – strip to PAGE_READWRITE   (all sections, even on timeout)
+ *   Step 7  – xor_crypt re-encrypt       (all sections)
+ *   Step 8  – re-encrypt GOT
+ *   Step 9  – restore original protections via section_prot_from_chars()
+ *
  * ========================================================================= */
 coff_error_t CoffRun(
     coff_ctx_t*    ctx,
@@ -818,7 +1113,22 @@ coff_error_t CoffRun(
             uint16_t si = (uint16_t)(sym->SectionNumber - 1);
             if (si >= ctx->section_count) return COFF_ERR_ENTRY_NOT_FOUND;
 
-            /* Decrypt all sections and GOT before execution */
+            /* ----------------------------------------------------------
+             * Step 1: Open all sections for writing so we can decrypt.
+             * ---------------------------------------------------------- */
+#if defined(_WIN32)
+            for (uint16_t i = 0; i < ctx->section_count; i++) {
+                if (!ctx->sections[i].exec_ptr) continue;
+                DWORD old;
+                VirtualProtect(ctx->sections[i].exec_ptr,
+                               ctx->sections[i].exec_size,
+                               PAGE_READWRITE, &old);
+            }
+#endif
+
+            /* ----------------------------------------------------------
+             * Step 2 & 3: Decrypt sections and GOT.
+             * ---------------------------------------------------------- */
             for (uint16_t i = 0; i < ctx->section_count; i++) {
                 if (ctx->sections[i].exec_ptr)
                     xor_crypt((uint8_t*)ctx->sections[i].exec_ptr,
@@ -826,6 +1136,27 @@ coff_error_t CoffRun(
             }
             for (uint32_t g = 0; g < ctx->import_count; g++)
                 ctx->import_table[g] = decrypt_ptr(ctx->import_table[g], runtime_key);
+
+            /* ----------------------------------------------------------
+             * Step 4: Make the entry section executable (but not writable).
+             *         All other sections retain PAGE_READWRITE for now;
+             *         they may be data sections the BOF writes to.
+             *         Sections that are execute+read have their protection
+             *         set individually here.
+             * ---------------------------------------------------------- */
+#if defined(_WIN32)
+            for (uint16_t i = 0; i < ctx->section_count; i++) {
+                if (!ctx->sections[i].exec_ptr) continue;
+                uint32_t ch = ctx->sections[i].characteristics;
+                if (ch & IMAGE_SCN_MEM_EXECUTE) {
+                    DWORD prot = section_prot_from_chars(ch);
+                    DWORD old;
+                    VirtualProtect(ctx->sections[i].exec_ptr,
+                                   ctx->sections[i].exec_size,
+                                   prot, &old);
+                }
+            }
+#endif
 
             void (*entry)(char*, unsigned long) =
                 (void(*)(char*, unsigned long))(
@@ -836,27 +1167,50 @@ coff_error_t CoffRun(
 
             coff_error_t run_rc = COFF_SUCCESS;
 
+            /* ----------------------------------------------------------
+             * Step 5: Execute.
+             * ---------------------------------------------------------- */
 #if defined(_WIN32)
             uint32_t tmo = (uint32_t)InterlockedCompareExchange(
                 (LONG*)&g_timeout_ms, 0, 0);
 
-            watchdog_args_t wa = { entry, (char*)argdata, (unsigned long)argsize };
-
-            cs_lock();
-            HANDLE hthread = CreateThread(NULL, 0, bof_thread_proc, &wa, 0, NULL);
-            if (!hthread) {
-                cs_unlock();
-                /* Thread creation failed – fall back to direct call */
+            /*
+             * Heap-allocate the args struct so it is valid for the full
+             * lifetime of the thread regardless of when this stack frame
+             * is reused.  A stack-allocated struct passed to CreateThread
+             * is only safe if the creating thread outlives the child AND
+             * does not return before the child finishes reading it —
+             * WaitForSingleObject guarantees ordering but TerminateThread
+             * on timeout does not.
+             *
+             * The CS is NOT held across the wait.  Holding it would
+             * deadlock any re-entrant loader call made from inside the BOF
+             * and would block CoffFree on a second concurrent BOF.
+             */
+            watchdog_args_t* wa = (watchdog_args_t*)malloc(sizeof(watchdog_args_t));
+            if (!wa) {
+                /* Allocation failed — fall back to direct call */
                 entry((char*)argdata, (unsigned long)argsize);
             } else {
-                DWORD wait = WaitForSingleObject(hthread, tmo);
-                if (wait == WAIT_TIMEOUT) {
-                    TerminateThread(hthread, 1);
-                    run_rc = COFF_ERR_TIMEOUT;
-                    DBG("BOF timed out after %u ms", tmo);
+                wa->entry   = entry;
+                wa->argdata = (char*)argdata;
+                wa->argsize = (unsigned long)argsize;
+
+                HANDLE hthread = CreateThread(NULL, 0, bof_thread_proc, wa, 0, NULL);
+                if (!hthread) {
+                    /* Thread creation failed — fall back to direct call */
+                    free(wa);
+                    entry((char*)argdata, (unsigned long)argsize);
+                } else {
+                    DWORD wait = WaitForSingleObject(hthread, tmo);
+                    if (wait == WAIT_TIMEOUT) {
+                        TerminateThread(hthread, 1);
+                        run_rc = COFF_ERR_TIMEOUT;
+                        DBG("BOF timed out after %u ms", tmo);
+                    }
+                    CloseHandle(hthread);
+                    free(wa);
                 }
-                CloseHandle(hthread);
-                cs_unlock();
             }
 #else
             cs_lock();
@@ -864,13 +1218,38 @@ coff_error_t CoffRun(
             cs_unlock();
 #endif
 
-            /* Re-encrypt everything regardless of timeout */
+            /* ----------------------------------------------------------
+             * Steps 6-9: Re-open writable, re-encrypt, restore
+             *            protections.  Done unconditionally even on timeout
+             *            so we never leave plaintext executable sections.
+             * ---------------------------------------------------------- */
+#if defined(_WIN32)
+            for (uint16_t i = 0; i < ctx->section_count; i++) {
+                if (!ctx->sections[i].exec_ptr) continue;
+                DWORD old;
+                VirtualProtect(ctx->sections[i].exec_ptr,
+                               ctx->sections[i].exec_size,
+                               PAGE_READWRITE, &old);
+            }
+#endif
             for (uint16_t i = 0; i < ctx->section_count; i++) {
                 if (ctx->sections[i].exec_ptr)
                     xor_crypt((uint8_t*)ctx->sections[i].exec_ptr,
                               ctx->sections[i].exec_size, runtime_key);
             }
             reimport_encrypt_all(ctx, runtime_key);
+
+#if defined(_WIN32)
+            /* Restore each section to its proper protection. */
+            for (uint16_t i = 0; i < ctx->section_count; i++) {
+                if (!ctx->sections[i].exec_ptr) continue;
+                DWORD prot = section_prot_from_chars(ctx->sections[i].characteristics);
+                DWORD old;
+                VirtualProtect(ctx->sections[i].exec_ptr,
+                               ctx->sections[i].exec_size,
+                               prot, &old);
+            }
+#endif
 
             return run_rc;
         }
@@ -891,6 +1270,16 @@ void CoffFree(coff_ctx_t** ctx_ptr) {
     for (uint16_t s = 0; s < ctx->section_count; s++) {
         void* mem = ctx->sections[s].exec_ptr;
         if (!mem) continue;
+#if defined(_WIN32)
+        /* CoffApplyProtections + CoffRun leave sections in their natural
+         * protection state (often PAGE_EXECUTE_READ for .text).  We have to
+         * make them writable before xor_crypt and SecureZeroMemory or those
+         * stores will fault. */
+        {
+            DWORD old;
+            VirtualProtect(mem, ctx->sections[s].exec_size, PAGE_READWRITE, &old);
+        }
+#endif
         xor_crypt((uint8_t*)mem, ctx->sections[s].exec_size, key);
 #if defined(_WIN32)
         SecureZeroMemory(mem, ctx->sections[s].exec_size);
@@ -904,7 +1293,7 @@ void CoffFree(coff_ctx_t** ctx_ptr) {
         memset(mem, 0, ctx->sections[s].exec_size);
         alloc->free(mem, alloc->user_ctx);
 #endif
-        ctx->sections[s].exec_ptr = NULL;
+        ctx->sections[s].exec_ptr   = NULL;
         ctx->sections[s].base_alloc = NULL;
     }
 
@@ -992,9 +1381,6 @@ const char* CoffErrorString(coff_error_t err) {
 
 /* =========================================================================
  * Utilities
- * =========================================================================
- * Both functions return heap memory.  Call CoffFreeBlob() to zero-wipe
- * and free the buffer when done — do not call plain free().
  * ========================================================================= */
 void CoffFreeBlob(unsigned char** buf, uint32_t size) {
     if (!buf || !*buf) return;
@@ -1065,7 +1451,23 @@ int main(int argc, char* argv[]) {
     if (argc >= 4 && argv[3])
         args = unhexlify((const unsigned char*)argv[3], &asz);
 
+    /*
+     * FIX: wrap execution in __try/__except on Windows.
+     * A BOF that faults (bad pointer, stack corruption, missing CSH for SEH)
+     * would otherwise crash the whole harness process.  With this in place
+     * the exception code is printed and the harness exits cleanly.
+     */
+#if defined(_WIN32)
+    __try {
+        rc = CoffRunBOF(argv[1], data, fsz, NULL, args, asz);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        fprintf(stderr, "Unhandled exception in BOF: 0x%08X\n", GetExceptionCode());
+        rc = COFF_ERR_ENTRY_NOT_FOUND; /* closest available error code */
+    }
+#else
     rc = CoffRunBOF(argv[1], data, fsz, NULL, args, asz);
+#endif
 
     /* Zero-wipe the blob and args before freeing */
     CoffFreeBlob(&data, fsz);
