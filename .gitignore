@@ -7,6 +7,8 @@
 /server/uploads/
 /server/agents.json
 /server/__pycache__/
+/server/key.pem
+/server/cert.pem
 *.pyc
 *.pyo
 
