@@ -228,6 +228,11 @@ typedef struct {
 
     coff_allocator_t allocator;
     bool             protections_applied;
+
+    /* Per-section next-trampoline offset (in slack between SizeOfRawData
+     * and exec_size).  Reset in CoffLoad before the relocation pass so
+     * multiple BOFs sharing one process don't step on each other. */
+    uint32_t         tramp_next[COFF_MAX_SECTIONS];
 } coff_ctx_t;
 
 /* -----------------------------------------------------------------

@@ -398,6 +398,15 @@ typedef struct _MY_PEB {
  * Hash-based PE export resolution (no plaintext GetProcAddress)
  * ========================================================================= */
 #if defined(_WIN32)
+/* Forward declaration for forwarder recursion. */
+static void* find_export_by_hash(HMODULE hmod, uint32_t func_hash);
+static HMODULE find_module_by_hash(uint32_t dll_hash);
+
+/* Resolve a PE export.  Handles forwarders: when the RVA stored in
+ * AddressOfFunctions points INSIDE the export directory, the bytes there
+ * are an ASCII string of the form "TargetDLL.TargetFunction" and we have
+ * to recursively resolve the real target.
+ */
 static void* find_export_by_hash(HMODULE hmod, uint32_t func_hash) {
     if (!hmod) return NULL;
     uint8_t* base = (uint8_t*)hmod;
@@ -405,16 +414,50 @@ static void* find_export_by_hash(HMODULE hmod, uint32_t func_hash) {
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
-    DWORD exp_rva = nt->OptionalHeader
-        .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
     if (!exp_rva) return NULL;
     IMAGE_EXPORT_DIRECTORY* exp = (IMAGE_EXPORT_DIRECTORY*)(base + exp_rva);
     DWORD* names  = (DWORD*)(base + exp->AddressOfNames);
     WORD*  ords   = (WORD*) (base + exp->AddressOfNameOrdinals);
     DWORD* funcs  = (DWORD*)(base + exp->AddressOfFunctions);
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
-        if (djb2((const char*)(base + names[i])) == func_hash)
-            return (void*)(base + funcs[ords[i]]);
+        if (djb2((const char*)(base + names[i])) != func_hash) continue;
+        DWORD fn_rva = funcs[ords[i]];
+
+        /* Forwarder?  RVA falls inside [exp_rva, exp_rva+exp_size). */
+        if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_size) {
+            const char* fwd = (const char*)(base + fn_rva);
+            /* Split at the first '.' — left=dll, right=func */
+            const char* dot = NULL;
+            for (const char* c = fwd; *c; c++) { if (*c == '.') { dot = c; break; } }
+            if (!dot) return NULL;
+
+            char dllname[64], funcname[128];
+            size_t dl = (size_t)(dot - fwd);
+            if (dl >= sizeof(dllname)) dl = sizeof(dllname) - 1;
+            memcpy(dllname, fwd, dl); dllname[dl] = 0;
+            /* Append .dll if not present (kernel32 forwards as "NTDLL.RtlXxx") */
+            size_t dlen = dl;
+            const char* dl_lower_ext = NULL;
+            for (size_t k = 0; k + 4 <= dl; k++) {
+                if ((dllname[k]=='.'||dllname[k]=='.') ) { dl_lower_ext = &dllname[k]; break; }
+            }
+            if (!dl_lower_ext && dlen + 4 < sizeof(dllname)) {
+                memcpy(dllname + dlen, ".dll", 5);
+            }
+            const char* fn_src = dot + 1;
+            size_t fl = 0; while (fn_src[fl] && fl + 1 < sizeof(funcname)) fl++;
+            memcpy(funcname, fn_src, fl); funcname[fl] = 0;
+
+            uint32_t lh = djb2_lower(dllname);
+            uint32_t fh = djb2(funcname);
+            HMODULE m = find_module_by_hash(lh);
+            if (!m) m = LoadLibraryA(dllname);
+            if (!m) return NULL;
+            return find_export_by_hash(m, fh);
+        }
+        return (void*)(base + fn_rva);
     }
     return NULL;
 }
@@ -525,7 +568,7 @@ typedef struct {
  * Returns the address of the trampoline (caller patches REL32 to it),
  * or NULL if no slack space remains. */
 static uint8_t* alloc_trampoline(coff_ctx_t* ctx, uint16_t si,
-                                  uint32_t raw_size, uint32_t* next_off,
+                                  uint32_t* next_off,
                                   void* target_addr) {
     if (!ctx || si >= ctx->section_count) return NULL;
     uint32_t exec_size = ctx->sections[si].exec_size;
@@ -568,12 +611,16 @@ static const char* g_fallback_dlls[] = {
  * their address directly and hand them to a BOF that references them.
  * Declared with the C signatures MinGW uses. */
 extern int __mingw_vsnprintf(char*, size_t, const char*, va_list);
-extern int __ms_vsnprintf(char*, size_t, const char*, va_list);
+extern int __ms_vsnprintf  (char*, size_t, const char*, va_list);
+extern int __mingw_vsprintf(char*, const char*, va_list);
+extern int __mingw_vprintf (const char*, va_list);
 
 typedef struct { const char* name; void* fn; } static_sym_t;
 static const static_sym_t g_static_syms[] = {
     { "__mingw_vsnprintf", (void*)&__mingw_vsnprintf },
     { "__ms_vsnprintf",    (void*)&__ms_vsnprintf    },
+    { "__mingw_vsprintf",  (void*)&__mingw_vsprintf  },
+    { "__mingw_vprintf",   (void*)&__mingw_vprintf   },
     { NULL, NULL }
 };
 static void* static_lookup(const char* name) {
@@ -803,6 +850,16 @@ coff_error_t CoffLoad(
     }
     ctx->section_count = hdr->NumberOfSections;
 
+    /* Initialise per-section trampoline next-offsets. Each section's
+     * trampoline region starts at SizeOfRawData (rounded up to 8) and
+     * grows up to exec_size (page-aligned). */
+    for (uint16_t s = 0; s < hdr->NumberOfSections; s++) {
+        const coff_sect_t* sh = (const coff_sect_t*)(
+            coff_data + sizeof(coff_file_header_t) + hdr->SizeOfOptionalHeader +
+            (uint64_t)s * sizeof(coff_sect_t));
+        ctx->tramp_next[s] = (sh->SizeOfRawData + 7u) & ~7u;
+    }
+
     /* Apply relocations */
     for (uint16_t s = 0; s < hdr->NumberOfSections; s++) {
         const coff_sect_t* sh = (const coff_sect_t*)(
@@ -884,25 +941,13 @@ coff_error_t CoffLoad(
                     if (is_imp) {
                         target = cached;        /* GOT slot for indirect call */
                     } else {
-                        /* Build a trampoline in this section\'s slack area.
-                         * Track next-offset per section in a static-sized array. */
-                        static uint32_t tramp_next[COFF_MAX_SECTIONS] = {0};
-                        static uint16_t tramp_init_for_load = 0xFFFF;
-                        if (tramp_init_for_load != s) {
-                            tramp_next[s] = 0;
-                            /* Find SizeOfRawData for section s */
-                            const coff_sect_t* sh_init = (const coff_sect_t*)(
-                                coff_data + sizeof(coff_file_header_t) +
-                                hdr->SizeOfOptionalHeader +
-                                (uint64_t)s * sizeof(coff_sect_t));
-                            tramp_next[s] = sh_init->SizeOfRawData;
-                            /* round up to 8 for alignment */
-                            tramp_next[s] = (tramp_next[s] + 7) & ~7u;
-                            tramp_init_for_load = s;
-                        }
+                        /* Trampoline in this section's slack region. */
                         uint8_t* tr = alloc_trampoline(ctx, s,
-                            ctx->sections[s].exec_size, &tramp_next[s], resolved);
+                            &ctx->tramp_next[s], resolved);
                         if (!tr) RELOC_FAIL(COFF_ERR_ALLOC_FAIL);
+                        fprintf(stderr, "[TR] sym='%s' resolved=%p tramp=%p target_in_tramp=%p\n",
+                            sym_name, resolved, (void*)tr, *(void**)(tr+6));
+                        fflush(stderr);
                         target = tr;
                     }
                 }
@@ -1196,13 +1241,19 @@ coff_error_t CoffRun(
                 wa->argdata = (char*)argdata;
                 wa->argsize = (unsigned long)argsize;
 
+                fprintf(stderr, "[CR] before CreateThread\n"); fflush(stderr);
                 HANDLE hthread = CreateThread(NULL, 0, bof_thread_proc, wa, 0, NULL);
+                fprintf(stderr, "[CR] hthread=%p\n", (void*)hthread); fflush(stderr);
                 if (!hthread) {
                     /* Thread creation failed — fall back to direct call */
                     free(wa);
+                    fprintf(stderr, "[CR] direct entry call\n"); fflush(stderr);
                     entry((char*)argdata, (unsigned long)argsize);
+                    fprintf(stderr, "[CR] direct entry returned\n"); fflush(stderr);
                 } else {
+                    fprintf(stderr, "[CR] waiting %u ms\n", tmo); fflush(stderr);
                     DWORD wait = WaitForSingleObject(hthread, tmo);
+                    fprintf(stderr, "[CR] wait=%lu\n", wait); fflush(stderr);
                     if (wait == WAIT_TIMEOUT) {
                         TerminateThread(hthread, 1);
                         run_rc = COFF_ERR_TIMEOUT;
