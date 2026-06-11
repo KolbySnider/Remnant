@@ -6,7 +6,8 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDH, generate_private_key, SECP256R1, EllipticCurvePublicKey
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 # ---------------------------------------------------------------------------
 # Server config — set entirely from CLI args at startup
@@ -102,21 +103,18 @@ def _poly1305_mac(otk: bytes, msg: bytes) -> bytes:
 
 def encrypt_response(key: bytes, plaintext: bytes) -> bytes:
     nonce  = os.urandom(12)
-    ct     = _chacha20_xor(plaintext, key, nonce, 1)
-    otk    = _chacha20_block(key, nonce, 0)[:32]
-    tag    = _poly1305_mac(otk, ct)
-    return nonce + ct + tag
-
+    ct_tag = AESGCM(key).encrypt(nonce, plaintext, associated_data=None)
+    return nonce + ct_tag
+ 
+ 
 def decrypt_request(key: bytes, data: bytes) -> bytes:
-    if len(data) < 28:   # 12 nonce + 0 ct + 16 tag minimum
-        return b''
-    nonce  = data[:12]
-    ct     = data[12:-16]
-    tag_in = data[-16:]
-    otk    = _chacha20_block(key, nonce, 0)[:32]
-    if _poly1305_mac(otk, ct) != tag_in:
-        return b''
-    return _chacha20_xor(ct, key, nonce, 1)
+    if len(data) < 28:            # 12 nonce + 0 ct + 16 tag minimum
+        return b""
+    nonce, ct_tag = data[:12], data[12:]
+    try:
+        return AESGCM(key).decrypt(nonce, ct_tag, associated_data=None)
+    except InvalidTag:
+        return b""
 
 # ---------------------------------------------------------------------------
 # ECDH key exchange

@@ -178,7 +178,7 @@ int http_post_encrypted(const char *host, int port, const char *path,
     *out_plain     = NULL;
     *out_plain_len = 0;
 
-    enc_body = chacha20poly1305_encrypt(payload, (size_t)payload_len, &enc_len);
+    enc_body = aead_encrypt(payload, (size_t)payload_len, &enc_len);
     if (!enc_body) goto cleanup;
 
     if (http_post_winhttp(host, port, path, enc_body, (int)enc_len,
@@ -188,7 +188,7 @@ int http_post_encrypted(const char *host, int port, const char *path,
     if (!resp || raw_resp_len < 12 + 16) goto cleanup;
 
     size_t   decrypted_len = 0;
-    uint8_t *plain = chacha20poly1305_decrypt(resp, (size_t)raw_resp_len,
+    uint8_t *plain = aead_decrypt(resp, (size_t)raw_resp_len,
                                               &decrypted_len);
     if (!plain) goto cleanup;
 
