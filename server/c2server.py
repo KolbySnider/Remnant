@@ -47,60 +47,6 @@ AUTH_HEADER   = "X-C2-Token"
 _print_lock     = threading.Lock()
 _current_prompt = ""
 
-# ---------------------------------------------------------------------------
-# ChaCha20-Poly1305 — simple scheme matching the C agent.
-#
-# Wire format: nonce(12) || ciphertext(N) || tag(16)
-# Tag covers ciphertext only (no AAD, no length block).
-#
-# Python's ChaCha20Poly1305 class follows RFC 8439 and appends a length block
-# to the Poly1305 input — the C agent does not, so we can't use that class here.
-# ---------------------------------------------------------------------------
-
-def _rotl32(v: int, n: int) -> int:
-    return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF
-
-def _chacha20_block(key: bytes, nonce: bytes, counter: int) -> bytes:
-    sigma = b"expand 32-byte k"
-    s = [struct.unpack_from("<I", sigma, i * 4)[0] for i in range(4)]
-    s += [struct.unpack_from("<I", key,   i * 4)[0] for i in range(8)]
-    s += [counter]
-    s += [struct.unpack_from("<I", nonce, i * 4)[0] for i in range(3)]
-    orig = s[:]
-    for _ in range(10):
-        for a, b, c, d in [(0,4,8,12),(1,5,9,13),(2,6,10,14),(3,7,11,15),
-                           (0,5,10,15),(1,6,11,12),(2,7,8,13),(3,4,9,14)]:
-            s[a]=(s[a]+s[b])&0xFFFFFFFF; s[d]^=s[a]; s[d]=_rotl32(s[d],16)
-            s[c]=(s[c]+s[d])&0xFFFFFFFF; s[b]^=s[c]; s[b]=_rotl32(s[b],12)
-            s[a]=(s[a]+s[b])&0xFFFFFFFF; s[d]^=s[a]; s[d]=_rotl32(s[d], 8)
-            s[c]=(s[c]+s[d])&0xFFFFFFFF; s[b]^=s[c]; s[b]=_rotl32(s[b], 7)
-    return struct.pack("<16I", *[(s[i] + orig[i]) & 0xFFFFFFFF for i in range(16)])
-
-def _chacha20_xor(data: bytes, key: bytes, nonce: bytes, counter: int) -> bytes:
-    out = bytearray(len(data))
-    pos, ctr = 0, counter
-    while pos < len(data):
-        block = _chacha20_block(key, nonce, ctr); ctr += 1
-        chunk = min(64, len(data) - pos)
-        for i in range(chunk):
-            out[pos + i] = data[pos + i] ^ block[i]
-        pos += chunk
-    return bytes(out)
-
-def _poly1305_mac(otk: bytes, msg: bytes) -> bytes:
-    rb = bytearray(otk[:16])
-    rb[3]&=15; rb[7]&=15; rb[11]&=15; rb[15]&=15
-    rb[4]&=252; rb[8]&=252; rb[12]&=252
-    r = int.from_bytes(rb, "little")
-    s = int.from_bytes(otk[16:32], "little")
-    p = (1 << 130) - 5
-    h = 0
-    for i in range(0, len(msg), 16):
-        block = msg[i:i + 16]
-        n = int.from_bytes(block, "little") + (1 << (8 * len(block)))
-        h = ((h + n) * r) % p
-    return ((h + s) & ((1 << 128) - 1)).to_bytes(16, "little")
-
 def encrypt_response(key: bytes, plaintext: bytes) -> bytes:
     nonce  = os.urandom(12)
     ct_tag = AESGCM(key).encrypt(nonce, plaintext, associated_data=None)

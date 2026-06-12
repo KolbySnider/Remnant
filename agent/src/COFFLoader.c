@@ -4,37 +4,6 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
 #endif
-/*
- * COFFLoader.c  –  Production-grade BOF/COFF Loader (v3 – fixed)
- *
- * Fixes over the submitted v3
- * ────────────────────────────
- * [FIX-PROT]   CoffRun() now correctly manages VirtualProtect across the
- *              full execution lifecycle:
- *                1. Strip all protections to PAGE_READWRITE (decrypt phase)
- *                2. Decrypt in-place
- *                3. Set the entry section to PAGE_EXECUTE_READ before call
- *                4. After return, set back to PAGE_READWRITE (re-encrypt)
- *                5. Re-encrypt in-place
- *                6. Restore original section protections via
- *                   CoffApplyProtections-equivalent logic
- *              The prior code left sections writable after execution, causing
- *              DEP/NX faults or EDR alerts on the second BOF call and leaving
- *              the re-encrypted data in an executable page.
- *
- * [FIX-CSH]    CoffLoaderInit() now prints a warning (debug builds) when
- *              __C_specific_handler cannot be resolved rather than silently
- *              storing NULL, which caused a hard crash when any BOF used SEH.
- *
- * [FIX-HARNESS] The standalone main() wraps CoffRunBOF in __try/__except on
- *              Windows so structured exceptions from a misbehaving BOF are
- *              caught and reported rather than crashing the host process.
- *
- * [FIX-STRIP]  Before calling CoffApplyProtections in CoffRunBOF the guard
- *              pages are already in place; a redundant second
- *              VirtualProtect(PAGE_READWRITE) at the top of CoffRun no longer
- *              fights them.
- */
 
 #include <limits.h>
 #include <stdio.h>
@@ -382,14 +351,14 @@ typedef struct _MY_PEB_LDR_DATA {
     LIST_ENTRY  InInitializationOrderModuleList;
 } MY_PEB_LDR_DATA;
 
-/* PEB — only the Ldr pointer is needed */
+/* PEB  only the Ldr pointer is needed */
 typedef struct _MY_PEB {
     BYTE            Reserved1[2];
     BYTE            BeingDebugged;
     BYTE            Reserved2[1];
     PVOID           Reserved3[2];
     MY_PEB_LDR_DATA* Ldr;
-    /* remaining fields omitted – we never access them */
+    /* remaining fields omitted  we never access them  */
 } MY_PEB;
 
 #endif /* _WIN32 */
@@ -953,6 +922,11 @@ coff_error_t CoffLoad(
                 }
             } else { RELOC_FAIL(COFF_ERR_SYMBOL_UNRESOLVED); }
 
+             fprintf(stderr, "[R%u/%u] sect=%u +0x%X type=%u sym='%s' symsect=%d defined=%d external=%d target=%p\n",
+                    r, sh->NumberOfRelocations, s, rel->VirtualAddress, rel->Type,
+                    sym_name, sym->SectionNumber, sym_defined, sym_external, target);
+            fflush(stderr);
+
             uint8_t* patch = (uint8_t*)ctx->sections[s].exec_ptr + rel->VirtualAddress;
             uint32_t u32 = 0; uint64_t u64 = 0;
 
@@ -1391,10 +1365,19 @@ coff_error_t CoffRunBOF(
 {
     coff_ctx_t* ctx = NULL;
     coff_error_t rc = CoffLoad(coff_data, filesize, allocator, &ctx);
+    fprintf(stderr, "[H] CoffLoad rc=%d (%s)\n", rc, CoffErrorString(rc));
+    fflush(stderr);
     if (rc != COFF_SUCCESS) return rc;
+
     rc = CoffApplyProtections(ctx);
+    fprintf(stderr, "[H] CoffApplyProtections rc=%d (%s)\n", rc, CoffErrorString(rc));
+    fflush(stderr);
     if (rc != COFF_SUCCESS) { CoffFree(&ctx); return rc; }
+
     rc = CoffRun(ctx, functionname, coff_data, filesize, argdata, argsize);
+    fprintf(stderr, "[H] CoffRun rc=%d (%s)\n", rc, CoffErrorString(rc));
+    fflush(stderr);
+
     CoffFree(&ctx);
     return rc;
 }
@@ -1502,12 +1485,6 @@ int main(int argc, char* argv[]) {
     if (argc >= 4 && argv[3])
         args = unhexlify((const unsigned char*)argv[3], &asz);
 
-    /*
-     * FIX: wrap execution in __try/__except on Windows.
-     * A BOF that faults (bad pointer, stack corruption, missing CSH for SEH)
-     * would otherwise crash the whole harness process.  With this in place
-     * the exception code is printed and the harness exits cleanly.
-     */
 #if defined(_WIN32)
     __try {
         rc = CoffRunBOF(argv[1], data, fsz, NULL, args, asz);

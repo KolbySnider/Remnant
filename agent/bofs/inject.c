@@ -1,9 +1,5 @@
 // cThreadHijack: Beacon Object File (BOF) to identify a legitimate thread within a remote process, suspend it, point the thread to shellcode, and resume/restore it
 // Author: Connor McGarr (@33y0re)
-// Fixed: removed local WINBASEAPI/DECLSPEC_IMPORT prototype declarations that
-//        conflict with beacon_compatibility.h macros; fixed DWORD payloadSize
-//        initialisation; fixed BeaconDataExtract int* cast; fixed (DWORD64)
-//        pointer arithmetic casts to (char*) for mycopy/RtlMoveMemory.
 
 #include <Windows.h>
 #include <TlHelp32.h>
