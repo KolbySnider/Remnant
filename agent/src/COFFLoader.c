@@ -477,6 +477,9 @@ typedef struct _MY_PEB {
 /* Forward declaration for forwarder recursion. */
 static void* find_export_by_hash(HMODULE hmod, uint32_t func_hash);
 static HMODULE find_module_by_hash(uint32_t dll_hash);
+static void* resolve_forwarder(HMODULE origin_hmod,
+                                const char* origin_name,
+                                const char* fwd);
 
 /**
  * @brief Resolve an exported function in a loaded module by djb2 hash of
@@ -507,47 +510,91 @@ static void* find_export_by_hash(HMODULE hmod, uint32_t func_hash) {
 
         /* Forwarder?  RVA falls inside [exp_rva, exp_rva+exp_size). */
         if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_size) {
-            const char* fwd = (const char*)(base + fn_rva);
-
-            /* Find the LAST dot — API set names contain dots in the version
-            * (e.g. "api-ms-win-security-base-l1-1-0.OpenProcessToken").
-            * The function name is everything after the final dot. */
-            const char* dot = NULL;
-            for (const char* c = fwd; *c; c++) {
-                if (*c == '.') dot = c;
-            }
-            if (!dot) return NULL;
-
-            char dllname[128], funcname[128];
-            size_t dl = (size_t)(dot - fwd);
-            if (dl == 0 || dl >= sizeof(dllname) - 5) return NULL;  /* room for ".dll\0" */
-            memcpy(dllname, fwd, dl);
-            dllname[dl] = '\0';
-
-            /* Append .dll only if no extension already present */
-            bool has_ext = false;
-            for (size_t k = 0; k < dl; k++) {
-                if (dllname[k] == '.') { has_ext = true; break; }
-            }
-            if (!has_ext) {
-                memcpy(dllname + dl, ".dll", 5);  /* includes NUL */
-            }
-
-            const char* fn_src = dot + 1;
-            size_t fl = strlen(fn_src);
-            if (fl == 0 || fl >= sizeof(funcname)) return NULL;
-            memcpy(funcname, fn_src, fl + 1);
-
-            uint32_t lh = djb2_lower(dllname);
-            uint32_t fh = djb2(funcname);
-            HMODULE m = find_module_by_hash(lh);
-            if (!m) m = LoadLibraryA(dllname);
-            if (!m) return NULL;
-            return find_export_by_hash(m, fh);
+            return resolve_forwarder(hmod, (const char*)(base + names[i]), (const char*)(base + fn_rva));
         }
         return (void*)(base + fn_rva);
     }
     return NULL;
+}
+
+/**
+ * @brief Resolve a forwarder string by following the chain through
+ *        api-set redirection and nested forwarders.  Falls back to
+ *        GetProcAddress on the originating module when manual resolution
+ *        cannot make progress (api-set tables, hot-patched exports).
+ *
+ * @param origin_hmod  Module the forwarder was found in (used as the
+ *                     final GetProcAddress fallback target).
+ * @param origin_name  The function name as it appeared in origin_hmod's
+ *                     export table.  Read directly from that table, so
+ *                     no plaintext name needs to live in this binary.
+ * @param fwd          NUL-terminated forwarder string "DllName.FuncName".
+ * @return Resolved function address, or NULL.
+ */
+static void* resolve_forwarder(HMODULE origin_hmod,
+                                const char* origin_name,
+                                const char* fwd)
+{
+    /* Split forwarder on the LAST dot.  The DLL part may contain dots
+     * (api-set names use hyphens, but legacy fwd strings sometimes carry
+     * ".dll"), so last-dot is the safe split point. */
+    const char* dot = NULL;
+    for (const char* c = fwd; *c; c++) {
+        if (*c == '.') dot = c;
+    }
+    if (!dot) return NULL;
+
+    char dllname[128], funcname[128];
+    size_t dl = (size_t)(dot - fwd);
+    if (dl == 0 || dl >= sizeof(dllname) - 5) goto fallback;
+    memcpy(dllname, fwd, dl);
+    dllname[dl] = '\0';
+
+    /* Append ".dll" if no extension is already present. */
+    bool has_ext = false;
+    for (size_t k = 0; k < dl; k++) {
+        if (dllname[k] == '.') { has_ext = true; break; }
+    }
+    if (!has_ext) memcpy(dllname + dl, ".dll", 5);
+
+    const char* fn_src = dot + 1;
+    size_t fl = strlen(fn_src);
+    if (fl == 0 || fl >= sizeof(funcname)) goto fallback;
+    memcpy(funcname, fn_src, fl + 1);
+
+    /* Ordinal forwarders ("DLLNAME.#123") are uncommon and not handled
+     * by the manual path.  Fall straight to the API. */
+    if (funcname[0] == '#') goto fallback;
+
+    /* api-set names are redirected by a PEB-resident table our walker
+     * cannot read.  Detect by prefix and skip the manual path. */
+    if ((dllname[0] == 'a' || dllname[0] == 'A') &&
+        (dllname[1] == 'p' || dllname[1] == 'P') &&
+        (dllname[2] == 'i' || dllname[2] == 'I') &&
+         dllname[3] == '-') {
+        goto fallback;
+    }
+
+    /* Legacy "DLL.Function" forwarder — resolve manually. */
+    uint32_t lh = djb2_lower(dllname);
+    uint32_t fh = djb2(funcname);
+    HMODULE m = find_module_by_hash(lh);
+    if (!m) m = LoadLibraryA(dllname);
+    if (!m) goto fallback;
+
+    /* Avoid trivial recursion: if the resolved module is the originating
+     * module, the manual path will loop.  Let the API resolve it. */
+    if (m == origin_hmod) goto fallback;
+
+    void* result = find_export_by_hash(m, fh);
+    if (result) return result;
+
+fallback:
+    /* Hand it to GetProcAddress on the originating module with the name
+     * we already have from that module's export table.  The Windows
+     * loader walks api-set redirection internally and is correct across
+     * versions; we are not. */
+    return (void*)GetProcAddress(origin_hmod, origin_name);
 }
 
 /**

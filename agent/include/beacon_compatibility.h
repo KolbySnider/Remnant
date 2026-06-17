@@ -51,6 +51,7 @@
 #endif
 #include <security.h>
 #include <secext.h>
+#include <sddl.h>
 /* For MIB_IPNETTABLE, MIB_TCPTABLE, GetIpNetTable, GetTcpTable */
 #include <iphlpapi.h>
 
