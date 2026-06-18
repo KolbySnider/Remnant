@@ -1,4 +1,4 @@
-#include "base.c"
+#include "base.h"
 #include <tlhelp32.h>
 
 void go(char* args, int len) {

@@ -4,8 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "http.h"
-#include "crypto.h"
+#include "transport/http.h"
+#include "crypto/crypto.h"
 #include "config.h"
 
 #define HTTP_BUF_SIZE  (512 * 1024)

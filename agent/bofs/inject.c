@@ -4,7 +4,8 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include "libc.h"
-#include "beacon_compatibility.h"
+#include "base.h"
+
 
 void go(char* argc, int len)
 {

@@ -10,7 +10,7 @@
  * Change from original: bofdefs.h → beacon_compatibility.h
  */
 
-#include "beacon_compatibility.h"
+#include "loader/beacon_compatibility.h"
 
 typedef struct _item {
     void*         elem;

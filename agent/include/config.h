@@ -1,10 +1,6 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// Fallback beacon configuration defaults.
-// Values are overridden by agent_config.h (generated from profile.json at build time).
-// Edit profile.json in the server folder and rebuild to change agent configuration.
-
 #ifndef C2_SERVER_IP
 #define C2_SERVER_IP "127.0.0.1"
 #endif

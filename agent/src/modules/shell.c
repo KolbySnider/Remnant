@@ -4,9 +4,9 @@
 #include <string.h>
 #include <stdarg.h>
 
-#include "shell.h"
-#include "COFFLoader.h"
-#include "beacon_compatibility.h"
+#include "modules/shell.h"
+#include "loader/COFFLoader.h"
+#include "loader/beacon_compatibility.h"
 #include "config.h"
 
 #define OUTPUT_BUF_SIZE  (256 * 1024)

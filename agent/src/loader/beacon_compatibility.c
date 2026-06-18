@@ -61,7 +61,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include "beacon_compatibility.h"
+#include "loader/beacon_compatibility.h"
 
 /* =========================================================================
  * Arch-specific process paths

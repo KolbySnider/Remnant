@@ -6,8 +6,8 @@
 #include <string.h>
 #include <stdio.h>
 
-#include "crypto.h"
-#include "ecdh.h"   /* for SESSION_KEY[32] and gen_random_bytes() */
+#include "crypto/crypto.h"
+#include "crypto/ecdh.h"   /* for SESSION_KEY[32] and gen_random_bytes() */
 
 /* BCrypt status check helper.  Anything other than STATUS_SUCCESS (0) is a
  * failure; the NTSTATUS itself is mostly only useful for logging. */

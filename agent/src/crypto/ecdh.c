@@ -4,8 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "ecdh.h"
-#include "http.h"
+#include "crypto/ecdh.h"
+#include "transport/http.h"
 #include "config.h"
 
 // ---------------------------------------------------------------------------

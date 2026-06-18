@@ -1,5 +1,5 @@
-#include "base.c"
 #include <iphlpapi.h>
+#include "base.h"
 
 #define NTOHS(x)  ((((x) & 0xFF) << 8) | (((x) >> 8) & 0xFF))
 

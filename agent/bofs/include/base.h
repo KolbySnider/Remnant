@@ -26,7 +26,7 @@
  */
 
 #include <windows.h>
-#include "beacon_compatibility.h"
+#include "loader/beacon_compatibility.h"
 
 #ifndef bufsize
 #  define bufsize 8192

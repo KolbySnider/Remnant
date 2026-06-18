@@ -4,9 +4,9 @@
 #include <string.h>
 
 #include "config.h"
-#include "ecdh.h"
-#include "http.h"
-#include "shell.h"
+#include "crypto/ecdh.h"
+#include "transport/http.h"
+#include "modules/shell.h"
 
 #define PATH_BUF_SIZE  512
 #define AGENT_ID_SIZE  256

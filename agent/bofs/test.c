@@ -1,5 +1,5 @@
+#include "base.h"
 
-#include "base.c"
 
 void go(char* args, int len) {
     /*

@@ -1,4 +1,4 @@
-#include "base.c"
+#include "base.h"
 #include <iphlpapi.h>
 
 /* Tiny byte-to-hex without sprintf (avoids __mingw_vsprintf). */

@@ -14,10 +14,10 @@
 
 #if defined(_WIN32)
 #include <windows.h>
-#include "beacon_compatibility.h"
+#include "loader/beacon_compatibility.h"
 #endif
 
-#include "COFFLoader.h"
+#include "loader/COFFLoader.h"
 
 /* =========================================================================
  * Debug helpers
