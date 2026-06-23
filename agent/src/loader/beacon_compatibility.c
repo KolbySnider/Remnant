@@ -172,47 +172,33 @@ unsigned char* InternalFunctions[30][2] = {
  * CoffResolveExport is declared in COFFLoader.h / beacon_compatibility.h.
  */
 void InitInternalFunctions(void) {
-    fprintf(stderr, "[D] InitInternalFunctions entry\n"); fflush(stderr);
-
     g_name_kernel32         = obf_decode(obf_kernel32);
     g_name_LoadLibraryA     = obf_decode(obf_LoadLibraryA);
     g_name_GetProcAddress   = obf_decode(obf_GetProcAddress);
     g_name_GetModuleHandleA = obf_decode(obf_GetModuleHandleA);
     g_name_FreeLibrary      = obf_decode(obf_FreeLibrary);
 
-    fprintf(stderr, "[D] kernel32='%s' LLA='%s' GPA='%s'\n",
-            g_name_kernel32         ? g_name_kernel32         : "NULL",
-            g_name_LoadLibraryA     ? g_name_LoadLibraryA     : "NULL",
-            g_name_GetProcAddress   ? g_name_GetProcAddress   : "NULL"); fflush(stderr);
-
     if (!g_name_kernel32 || !g_name_LoadLibraryA ||
         !g_name_GetProcAddress || !g_name_GetModuleHandleA ||
         !g_name_FreeLibrary) {
-        fprintf(stderr, "[D] InitInternalFunctions: alloc failed\n"); fflush(stderr);
         return;
     }
 
     InternalFunctions[23][0] = (unsigned char*)g_name_LoadLibraryA;
     InternalFunctions[23][1] = (unsigned char*)
         CoffResolveExport(g_name_kernel32, g_name_LoadLibraryA);
-    fprintf(stderr, "[D] LoadLibraryA=%p\n", (void*)InternalFunctions[23][1]); fflush(stderr);
 
     InternalFunctions[24][0] = (unsigned char*)g_name_GetProcAddress;
     InternalFunctions[24][1] = (unsigned char*)
         CoffResolveExport(g_name_kernel32, g_name_GetProcAddress);
-    fprintf(stderr, "[D] GetProcAddress=%p\n", (void*)InternalFunctions[24][1]); fflush(stderr);
 
     InternalFunctions[25][0] = (unsigned char*)g_name_GetModuleHandleA;
     InternalFunctions[25][1] = (unsigned char*)
         CoffResolveExport(g_name_kernel32, g_name_GetModuleHandleA);
-    fprintf(stderr, "[D] GetModuleHandleA=%p\n", (void*)InternalFunctions[25][1]); fflush(stderr);
 
     InternalFunctions[26][0] = (unsigned char*)g_name_FreeLibrary;
     InternalFunctions[26][1] = (unsigned char*)
         CoffResolveExport(g_name_kernel32, g_name_FreeLibrary);
-    fprintf(stderr, "[D] FreeLibrary=%p\n", (void*)InternalFunctions[26][1]); fflush(stderr);
-
-    fprintf(stderr, "[D] InitInternalFunctions done\n"); fflush(stderr);
 }
 
 static char*    g_out_buf     = NULL;
