@@ -48,7 +48,8 @@ The COFFLoader (`agent/src/loader/COFFLoader.c`) is a hardened, extended COFF ob
 - **SEH handler registration** — `__C_specific_handler` (x64) is resolved directly from the linker (not via `GetProcAddress`, which cannot find compiler-internal symbols) and registered so BOFs with structured exception handling work correctly.
 - **Guard page detection** — page boundary alignment and read guards catch overruns in relocation processing before they silently corrupt memory.
 - **Execution timeout** — configurable `COFF_DEFAULT_TIMEOUT_MS` kills runaway BOFs without hanging the beacon loop.
-- **Idempotent init** — `CoffLoaderInit()` uses `InterlockedCompareExchange` for lock-free, thread-safe one-time initialization; safe to call repeatedly.
+- **At-rest section encryption** — loaded sections and resolved import addresses are XOR-encrypted in memory between executions using a per-run key derived from stack ASLR and a high-resolution timer. Sections are decrypted immediately before 
+  the BOF's `go()` entry point is called and re-encrypted on return.
 
 
 ### Structured Tasking Pipeline
