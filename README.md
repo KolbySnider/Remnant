@@ -223,7 +223,6 @@ Arguments are packed by the server using the BeaconPack format before being embe
 | `arp_cache`       | ARP table entries via `GetIpNetTable`                                  |
 | `tcp_connections` | Active TCP connections and states via `GetTcpTable2`                   |
 | `dirlist`         | Directory listing with file sizes and attributes                       |
-| `inject`          | Shellcode injection via `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread` |
 
 ### Writing Your Own BOFs
 
