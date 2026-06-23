@@ -2,10 +2,6 @@
 
 A lightweight, C2 framework that consists of a Python-based server with an interactive CLI and a Windows beacon agent written in C, communicating over an encrypted custom binary protocol with support for in-process Beacon Object File (BOF) execution.
 
-> **For authorized use only.** This framework is intended for controlled lab environments, security research, and authorized penetration testing engagements.
-
----
-
 ---
 
 ## Features
@@ -238,7 +234,7 @@ void go(char *args, int len) {
 This project builds on foundational work from several open-source security research projects. The following projects were referenced, adapted, or directly influenced the design:
 
 **[TrustedSec](https://github.com/trustedsec)**
-The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedSec's open-source tooling. The `beacon_compatibility` shim's KERNEL32$, ADVAPI32$, NTDLL$, and related thunk definitions draw directly from their BOF development headers. The included BOF modules follow the TrustedSec BOF authoring conventions. `inject.c` is attributed to Connor McGarr (@33y0re).
+The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedSec's open-source tooling. The `beacon_compatibility` shim's KERNEL32$, ADVAPI32$, NTDLL$, and related thunk definitions draw directly from their BOF development headers. The included BOF modules follow the TrustedSec BOF authoring conventions. 
 
 **[Havoc C2](https://github.com/HavocFramework/Havoc)**
 The wire protocol framing, command ID namespace conventions, and the batch-package architecture were influenced by Havoc's agent-server communication design. The `PKG_FLAG_BATCH` pattern for coalescing multiple task results into a single checkin is modeled after Havoc's packet batching approach.
