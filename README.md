@@ -1,6 +1,6 @@
 # Command & Control Framework
 
-A lightweight, C2 framework that consists of a Python-based server with an interactive CLI and a Windows beacon agent written in C, communicating over an encrypted custom binary protocol with support for in-process Beacon Object File (BOF) execution.
+A lightweight C2 framework that consists of a Python-based server with an interactive CLI and a Windows beacon agent written in C, communicating over an encrypted custom binary protocol with support for in-process Beacon Object File (BOF) execution.
 
 ---
 
@@ -46,6 +46,7 @@ The COFFLoader (`agent/src/loader/COFFLoader.c`) is a hardened, extended COFF ob
 - **Execution timeout** — configurable `COFF_DEFAULT_TIMEOUT_MS` kills runaway BOFs without hanging the beacon loop.
 - **Idempotent init** — `CoffLoaderInit()` uses `InterlockedCompareExchange` for lock-free, thread-safe one-time initialization; safe to call repeatedly.
 
+
 ### Structured Tasking Pipeline
 
 Tasks flow through a typed queue rather than raw command strings:
@@ -90,44 +91,8 @@ Beacons are built from the server's interactive CLI using the `generate` command
 ```
  > generate [--ip IP] [--port PORT] [--ua USER_AGENT] [--token AUTH_TOKEN]
             [--sleep MS] [--jitter MS] [--https] [--out filename.exe]
-Beacons are built from the server's interactive CLI using the `generate` command. The server invokes `agent/build.bat` with the supplied parameters and writes the output binary to `agent/build/`.
-
-**Prerequisites** (on the machine running the server):
-- `x86_64-w64-mingw32-gcc` on PATH (MinGW-w64)
-
-### generate command
-
-```
- > generate [--ip IP] [--port PORT] [--ua USER_AGENT] [--token AUTH_TOKEN]
-            [--sleep MS] [--jitter MS] [--https] [--out filename.exe]
 ```
 
-All flags are optional. Defaults are pulled from the server's own listen address, port, and auth token.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--ip` | server listen IP (or `127.0.0.1`) | C2 callback address baked into the beacon |
-| `--port` | server listen port | C2 callback port |
-| `--ua` | `Mozilla/5.0 (Windows NT 10.0; Win64; x64)...` | HTTP User-Agent header |
-| `--token` | server auth token | `X-C2-Token` header sent on registration |
-| `--sleep` | `5000` | Base checkin interval in milliseconds |
-| `--jitter` | `3000` | Symmetric jitter in milliseconds |
-| `--https` | off | Enable HTTPS (certificate validation is disabled) |
-| `--out` | `beacon.exe` | Output filename under `agent/build/` |
-
-### Examples
-
-```
- > generate
- > generate --ip 10.0.0.1 --port 443 --out implant.exe
- > generate --ip 10.0.0.1 --port 443 --https --token MyToken123 --sleep 10000 --jitter 5000 --out beacon_https.exe
-```
-
-The server prints the final binary path on success:
-
-```
- 12:00:00  BUILD  Building  beacon.exe  ip=10.0.0.1  port=443  https=False
- 12:00:01  OK     Built  /path/to/agent/build/beacon.exe
 All flags are optional. Defaults are pulled from the server's own listen address, port, and auth token.
 
 | Flag | Default | Description |
@@ -159,11 +124,8 @@ The server prints the final binary path on success:
 Build output:
 - `agent/build/<filename>` — the beacon binary
 - `agent/build/bofs/*.obj` — compiled BOF modules (also copied to `server/bofs/`)
-- `agent/build/<filename>` — the beacon binary
-- `agent/build/bofs/*.obj` — compiled BOF modules (also copied to `server/bofs/`)
 
 ---
-
 
 ## Running
 
@@ -174,6 +136,15 @@ cd server
 python c2server.py
 ```
 
+Optional: set an auth token so only beacons that know the token can register:
+
+```bash
+# Windows
+set C2_AUTH_TOKEN=MyToken123 && python c2server.py
+
+# Linux/macOS
+C2_AUTH_TOKEN=MyToken123 python c2server.py
+```
 
 The server starts on `0.0.0.0:8080`, restores any previously saved agent state, and opens an interactive CLI:
 
@@ -188,6 +159,16 @@ The server starts on `0.0.0.0:8080`, restores any previously saved agent state, 
 
  >
 ```
+
+---
+
+## Communication Flow
+
+1. **Registration** — the beacon sends a 65-byte ECDH-P256 public key to `POST /register`. The server generates its own ephemeral keypair, derives the session key (`SHA-256` of the shared secret X-coordinate), assigns a UUID, and replies with its own public key and the UUID. The beacon derives the same session key independently. Keys are never transmitted.
+
+2. **Checkin** — the beacon polls `POST /checkin/<uuid>` on a jittered interval. Each request carries any buffered task output in an encrypted package. The server decrypts, processes the output, and responds with any pending tasks batched into a single encrypted package.
+
+3. **Dispatch** — the beacon decrypts the response, reads the command ID from each sub-package, and dispatches accordingly: shell commands run via `cmd.exe /c` with output captured; BOF tasks are passed directly to the COFFLoader with the pre-packed argument buffer embedded in the package.
 
 ---
 
@@ -242,6 +223,7 @@ Arguments are packed by the server using the BeaconPack format before being embe
 | `arp_cache`       | ARP table entries via `GetIpNetTable`                                  |
 | `tcp_connections` | Active TCP connections and states via `GetTcpTable2`                   |
 | `dirlist`         | Directory listing with file sizes and attributes                       |
+| `inject`          | Shellcode injection via `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread` |
 
 ### Writing Your Own BOFs
 
@@ -263,11 +245,9 @@ void go(char *args, int len) {
 }
 ```
 
-
-
 ---
 
-## Credits and Prior Art
+## Credits 
 
 This project builds on foundational work from several open-source security research projects. The following projects were referenced, adapted, or directly influenced the design:
 
@@ -275,5 +255,4 @@ This project builds on foundational work from several open-source security resea
 The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedSec's open-source tooling. The `beacon_compatibility` shim's KERNEL32$, ADVAPI32$, NTDLL$, and related thunk definitions draw directly from their BOF development headers. The included BOF modules follow the TrustedSec BOF authoring conventions. 
 
 **[Havoc C2](https://github.com/HavocFramework/Havoc)**
-The wire protocol framing, command ID namespace conventions, and the batch-package architecture were influenced by Havoc's agent-server communication design. The `PKG_FLAG_BATCH` pattern for coalescing multiple task results into a single checkin is modeled after Havoc's packet batching approach.
----
+The wire protocol framing, command ID namespace conventions, and the batch-package architecture were influenced by Havoc's agent-server communication design. 
