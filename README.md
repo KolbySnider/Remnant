@@ -1,4 +1,4 @@
-# Command & Control Framework
+# Remnant C2
 
 A lightweight C2 framework that consists of a Python-based server with an interactive CLI and a Windows beacon agent written in C, communicating over an encrypted custom binary protocol with support for in-process Beacon Object File (BOF) execution.
 
