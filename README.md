@@ -2,6 +2,10 @@
 
 A lightweight C2 framework that consists of a Python-based server with an interactive CLI and a Windows beacon agent written in C, communicating over an encrypted custom binary protocol with support for in-process Beacon Object File (BOF) execution.
 
+
+
+<img width="605" height="183" alt="C C" src="https://github.com/user-attachments/assets/de76f2d8-26da-47eb-9a80-de2d01a3fd64" />
+
 ---
 
 ## Features
