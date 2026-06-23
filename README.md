@@ -126,7 +126,6 @@ Build output:
 
 ---
 
-
 ## Running
 
 ### Server
@@ -239,3 +238,7 @@ The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedS
 **[Havoc C2](https://github.com/HavocFramework/Havoc)**
 The wire protocol framing, command ID namespace conventions, and the batch-package architecture were influenced by Havoc's agent-server communication design. The `PKG_FLAG_BATCH` pattern for coalescing multiple task results into a single checkin is modeled after Havoc's packet batching approach.
 ---
+
+## License
+
+For research and authorized use only. See `LICENSE` for terms.
