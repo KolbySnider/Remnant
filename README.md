@@ -2,10 +2,6 @@
 
 A lightweight, C2 framework that consists of a Python-based server with an interactive CLI and a Windows beacon agent written in C, communicating over an encrypted custom binary protocol with support for in-process Beacon Object File (BOF) execution.
 
-> **For authorized use only.** This framework is intended for controlled lab environments, security research, and authorized penetration testing engagements.
-
----
-
 ---
 
 ## Features
@@ -50,20 +46,6 @@ The COFFLoader (`agent/src/loader/COFFLoader.c`) is a hardened, extended COFF ob
 - **Execution timeout** — configurable `COFF_DEFAULT_TIMEOUT_MS` kills runaway BOFs without hanging the beacon loop.
 - **Idempotent init** — `CoffLoaderInit()` uses `InterlockedCompareExchange` for lock-free, thread-safe one-time initialization; safe to call repeatedly.
 
-### Cobalt Strike–Compatible BOF Runtime
-
-`beacon_compatibility.c/h` provides the BOF API shim that Cobalt Strike BOFs expect, extended beyond the baseline to support the full TrustedSec BOF catalog:
-
-- `KERNEL32$` / `KERNEL32$` (both mixed-case and all-caps aliases)
-- `ADVAPI32$` — registry, token, security descriptor APIs
-- `SECUR32$` — `GetUserNameExA` and related extended identity APIs
-- `IPHLPAPI$` — `GetIpNetTable`, `GetTcpTable2`, and ARP/routing APIs
-- `WS2_32$` — `inet_ntoa`, `inet_addr`, `WSAStartup`, and socket APIs
-- `NTDLL$` — `RtlMoveMemory` and other NT-native functions
-- Full `BeaconPrintf`, `BeaconOutput`, `BeaconDataParse`, `BeaconDataExtract` implementations with internal output buffering
-
-BOFs built against the standard TrustedSec base headers compile and run without modification.
-
 ### Structured Tasking Pipeline
 
 Tasks flow through a typed queue rather than raw command strings:
@@ -98,33 +80,52 @@ The beacon's checkin interval uses configurable base sleep plus symmetric jitter
 
 ## Building
 
-From the `agent/` directory:
+Beacons are built from the server's interactive CLI using the `generate` command. The server invokes `agent/build.bat` with the supplied parameters and writes the output binary to `agent/build/`.
 
-```bat
-build.bat [IP] [PORT] [USER_AGENT] [AUTH_TOKEN] [SLEEP_MS] [JITTER_MS] [USE_HTTPS] [output.exe]
+**Prerequisites** (on the machine running the server):
+- `x86_64-w64-mingw32-gcc` on PATH (MinGW-w64)
+
+### generate command
+
+```
+ > generate [--ip IP] [--port PORT] [--ua USER_AGENT] [--token AUTH_TOKEN]
+            [--sleep MS] [--jitter MS] [--https] [--out filename.exe]
 ```
 
-All arguments are optional and default to the values in `config.h`. Examples:
+All flags are optional. Defaults are pulled from the server's own listen address, port, and auth token.
 
-```bat
-:: Default build (127.0.0.1:8080, no auth, 5s sleep)
-build.bat
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ip` | server listen IP (or `127.0.0.1`) | C2 callback address baked into the beacon |
+| `--port` | server listen port | C2 callback port |
+| `--ua` | `Mozilla/5.0 (Windows NT 10.0; Win64; x64)...` | HTTP User-Agent header |
+| `--token` | server auth token | `X-C2-Token` header sent on registration |
+| `--sleep` | `5000` | Base checkin interval in milliseconds |
+| `--jitter` | `3000` | Symmetric jitter in milliseconds |
+| `--https` | off | Enable HTTPS (certificate validation is disabled) |
+| `--out` | `beacon.exe` | Output filename under `agent/build/` |
 
-:: Production build targeting a remote server
-build.bat 10.0.0.1 443 "Mozilla/5.0" MyToken123 10000 5000 0 implant.exe
+### Examples
 
-:: HTTPS build
-build.bat 10.0.0.1 443 "Mozilla/5.0" MyToken123 10000 5000 1 beacon_https.exe
+```
+ > generate
+ > generate --ip 10.0.0.1 --port 443 --out implant.exe
+ > generate --ip 10.0.0.1 --port 443 --https --token MyToken123 --sleep 10000 --jitter 5000 --out beacon_https.exe
+```
+
+The server prints the final binary path on success:
+
+```
+ 12:00:00  BUILD  Building  beacon.exe  ip=10.0.0.1  port=443  https=False
+ 12:00:01  OK     Built  /path/to/agent/build/beacon.exe
 ```
 
 Build output:
-- `agent/build/beacon.exe` — agent binary
-- `agent/build/bofs/*.obj` — compiled BOF modules
-- `server/bofs/*.obj` — BOFs deployed and ready to serve
-
-The build script compiles each source independently, then links against `ws2_32`, `bcrypt`, `winhttp`, `iphlpapi`, `secur32`, and `advapi32`. Strip (`-Wl,-s`) and dead-code elimination (`-Wl,--gc-sections`) are applied by default.
+- `agent/build/<filename>` — the beacon binary
+- `agent/build/bofs/*.obj` — compiled BOF modules (also copied to `server/bofs/`)
 
 ---
+
 
 ## Running
 
@@ -233,16 +234,8 @@ void go(char *args, int len) {
 This project builds on foundational work from several open-source security research projects. The following projects were referenced, adapted, or directly influenced the design:
 
 **[TrustedSec](https://github.com/trustedsec)**
-The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedSec's open-source tooling. The `beacon_compatibility` shim's KERNEL32$, ADVAPI32$, NTDLL$, and related thunk definitions draw directly from their BOF development headers. The included BOF modules follow the TrustedSec BOF authoring conventions. `inject.c` is attributed to Connor McGarr (@33y0re).
+The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedSec's open-source tooling. The `beacon_compatibility` shim's KERNEL32$, ADVAPI32$, NTDLL$, and related thunk definitions draw directly from their BOF development headers. The included BOF modules follow the TrustedSec BOF authoring conventions. 
 
 **[Havoc C2](https://github.com/HavocFramework/Havoc)**
 The wire protocol framing, command ID namespace conventions, and the batch-package architecture were influenced by Havoc's agent-server communication design. The `PKG_FLAG_BATCH` pattern for coalescing multiple task results into a single checkin is modeled after Havoc's packet batching approach.
-
-**[SHAD0W](https://github.com/bats3c/shad0w)**
-The overall project structure — a C beacon communicating with a Python C2 server over an encrypted channel with a Cobalt Strike–compatible BOF runtime — was inspired by bats3c's SHAD0W framework. The approach of deriving a per-session symmetric key from an ECDH handshake and using it for all subsequent traffic follows SHAD0W's key establishment model.
-
 ---
-
-## License
-
-For research and authorized use only. See `LICENSE` for terms.
