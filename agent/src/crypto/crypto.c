@@ -7,10 +7,8 @@
 #include <stdio.h>
 
 #include "crypto/crypto.h"
-#include "crypto/ecdh.h"   /* for SESSION_KEY[32] and gen_random_bytes() */
+#include "crypto/ecdh.h"
 
-/* BCrypt status check helper.  Anything other than STATUS_SUCCESS (0) is a
- * failure; the NTSTATUS itself is mostly only useful for logging. */
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 #endif
@@ -19,17 +17,15 @@
 #define TAG_LEN    16
 #define KEY_LEN    32   /* AES-256 */
 
-/* ---------------------------------------------------------------------------
- * gcm_open_key — internal helper.
- *
- * Opens the AES provider, switches it to GCM mode, and imports SESSION_KEY
- * as an AES-256 symmetric key.  Returns 0 on success; on failure all
- * resources are freed and *hAlg / *hKey / *pbKeyObject are zeroed.
- *
- * Per BCrypt's API contract the caller must keep pbKeyObject alive for the
- * lifetime of hKey — it's the heap backing for the key handle's internal
- * state.  gcm_close_key() frees both together.
- * --------------------------------------------------------------------------- */
+/**
+ * @brief Open the BCrypt AES provider in GCM mode and import SESSION_KEY.
+ *        pbKeyObject must stay alive for the lifetime of hKey;
+ *        pass both to gcm_close_key() when done.
+ * @param hAlg        Receives the algorithm provider handle.
+ * @param hKey        Receives the symmetric key handle.
+ * @param pbKeyObject Receives the key object backing buffer.
+ * @return 0 on success, -1 on any BCrypt failure (all handles cleaned up).
+ */
 static int gcm_open_key(BCRYPT_ALG_HANDLE *hAlg,
                         BCRYPT_KEY_HANDLE *hKey,
                         PUCHAR            *pbKeyObject)
@@ -48,7 +44,6 @@ static int gcm_open_key(BCRYPT_ALG_HANDLE *hAlg,
                           sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
     if (!NT_SUCCESS(s)) goto fail;
 
-    /* Ask BCrypt how large the per-key state buffer needs to be. */
     s = BCryptGetProperty(*hAlg, BCRYPT_OBJECT_LENGTH,
                           (PUCHAR)&cbObject, sizeof(DWORD), &cbResult, 0);
     if (!NT_SUCCESS(s) || cbObject == 0) goto fail;
@@ -70,6 +65,11 @@ fail:
     return -1;
 }
 
+/**
+ * @param hAlg        Algorithm provider handle from gcm_open_key().
+ * @param hKey        Symmetric key handle from gcm_open_key().
+ * @param pbKeyObject Key object backing buffer from gcm_open_key().
+ */
 static void gcm_close_key(BCRYPT_ALG_HANDLE hAlg,
                           BCRYPT_KEY_HANDLE hKey,
                           PUCHAR            pbKeyObject)
@@ -79,16 +79,10 @@ static void gcm_close_key(BCRYPT_ALG_HANDLE hAlg,
     if (hAlg)        BCryptCloseAlgorithmProvider(hAlg, 0);
 }
 
-/* ---------------------------------------------------------------------------
- * aead_encrypt
- * --------------------------------------------------------------------------- */
-uint8_t *aead_encrypt(const uint8_t *plaintext, size_t plain_len,
-                      size_t *out_len)
+uint8_t *aead_encrypt(const uint8_t *plaintext, size_t plain_len, size_t *out_len)
 {
     if (!out_len) return NULL;
     *out_len = 0;
-
-    /* Allow plain_len == 0 (empty body checkin uses this). */
     if (plain_len > 0 && !plaintext) return NULL;
 
     BCRYPT_ALG_HANDLE hAlg        = NULL;
@@ -102,22 +96,20 @@ uint8_t *aead_encrypt(const uint8_t *plaintext, size_t plain_len,
     out = (uint8_t *)malloc(total ? total : 1);
     if (!out) goto cleanup;
 
-    /* Fresh 96-bit nonce.  BCryptGenRandom under the hood. */
     gen_random_bytes(out, NONCE_LEN);
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
     BCRYPT_INIT_AUTH_MODE_INFO(authInfo);
-    authInfo.pbNonce = out;                    /* first 12 bytes of output */
+    authInfo.pbNonce = out;
     authInfo.cbNonce = NONCE_LEN;
-    authInfo.pbTag   = out + NONCE_LEN + plain_len;  /* last 16 bytes  */
+    authInfo.pbTag   = out + NONCE_LEN + plain_len;
     authInfo.cbTag   = TAG_LEN;
-    /* No AAD: pbAuthData / cbAuthData stay NULL / 0 from the init macro. */
 
     ULONG    cbCipher = 0;
     NTSTATUS s = BCryptEncrypt(hKey,
                                 (PUCHAR)plaintext, (ULONG)plain_len,
                                 &authInfo,
-                                NULL, 0,                  /* no IV chaining state */
+                                NULL, 0,
                                 out + NONCE_LEN, (ULONG)plain_len,
                                 &cbCipher, 0);
     if (!NT_SUCCESS(s) || cbCipher != (ULONG)plain_len) {
@@ -132,11 +124,7 @@ cleanup:
     return out;
 }
 
-/* ---------------------------------------------------------------------------
- * aead_decrypt
- * --------------------------------------------------------------------------- */
-uint8_t *aead_decrypt(const uint8_t *encrypted, size_t enc_len,
-                      size_t *out_len)
+uint8_t *aead_decrypt(const uint8_t *encrypted, size_t enc_len, size_t *out_len)
 {
     if (!out_len) return NULL;
     *out_len = 0;
@@ -151,8 +139,7 @@ uint8_t *aead_decrypt(const uint8_t *encrypted, size_t enc_len,
 
     if (gcm_open_key(&hAlg, &hKey, &pbKeyObject) != 0) return NULL;
 
-    /* +1 for the NUL terminator we append for convenience.  Caller can
-     * pass the buffer straight to strlen/printf without copying. */
+    /* +1 so callers can use the buffer as a C string without copying */
     plain = (uint8_t *)malloc(cipher_len + 1);
     if (!plain) goto cleanup;
 
@@ -171,8 +158,6 @@ uint8_t *aead_decrypt(const uint8_t *encrypted, size_t enc_len,
                                 plain, (ULONG)cipher_len,
                                 &cbPlain, 0);
 
-    /* STATUS_AUTH_TAG_MISMATCH (0xC000A002) — silent drop, the caller
-     * should treat NULL as "bad packet" and not log the key. */
     if (!NT_SUCCESS(s) || cbPlain != (ULONG)cipher_len) {
 #ifdef DEBUG
         fprintf(stderr, "[!] AES-GCM verify failed (NTSTATUS 0x%08lX)\n",

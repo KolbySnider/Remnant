@@ -9,22 +9,6 @@
 extern "C" {
 #endif
 
-/* =========================================================================
- * COFFLoader - Production-grade Beacon Object File / COFF Loader
- * =========================================================================
- * v3 additions:
- *  - CoffLoaderInit() / CoffLoaderTeardown() for explicit lifecycle management
- *  - __C_specific_handler resolved once inside CoffLoaderInit, not per-load
- *  - CoffRun watchdog: BOF executes on a dedicated thread with configurable
- *    timeout; a hung BOF is detected and the thread is terminated cleanly
- *  - getFileContents / unhexlify zero-wipe the blob after CoffRunBOF returns
- *  - CoffResolveExport() exposed so BOFs using DYNAMIC_LIB_COUNT can call the
- *    hardened hash-based resolver instead of raw LoadLibraryA/GetProcAddress
- * ========================================================================= */
-
-/* -----------------------------------------------------------------
- * COFF on-disk structures
- * ----------------------------------------------------------------- */
 #pragma pack(push, 1)
 
 typedef struct coff_file_header {
@@ -70,16 +54,10 @@ typedef struct coff_sym {
 
 #pragma pack(pop)
 
-/* -----------------------------------------------------------------
- * Machine types
- * ----------------------------------------------------------------- */
 #define MACHINETYPE_AMD64   0x8664
 #define MACHINETYPE_I386    0x014C
 #define MACHINETYPE_ARM64   0xAA64
 
-/* -----------------------------------------------------------------
- * Relocation types – AMD64
- * ----------------------------------------------------------------- */
 #define IMAGE_REL_AMD64_ABSOLUTE  0x0000
 #define IMAGE_REL_AMD64_ADDR64    0x0001
 #define IMAGE_REL_AMD64_ADDR32    0x0002
@@ -98,9 +76,6 @@ typedef struct coff_sym {
 #define IMAGE_REL_AMD64_PAIR      0x000F
 #define IMAGE_REL_AMD64_SSPAN32   0x0010
 
-/* -----------------------------------------------------------------
- * Relocation types – i386
- * ----------------------------------------------------------------- */
 #define IMAGE_REL_I386_ABSOLUTE   0x0000
 #define IMAGE_REL_I386_DIR16      0x0001
 #define IMAGE_REL_I386_REL16      0x0002
@@ -113,9 +88,6 @@ typedef struct coff_sym {
 #define IMAGE_REL_I386_SECREL7    0x000D
 #define IMAGE_REL_I386_REL32      0x0014
 
-/* -----------------------------------------------------------------
- * Section characteristic flags
- * ----------------------------------------------------------------- */
 #define IMAGE_SCN_CNT_CODE               0x00000020
 #define IMAGE_SCN_CNT_INITIALIZED_DATA   0x00000040
 #define IMAGE_SCN_CNT_UNINITIALIZED_DATA 0x00000080
@@ -127,9 +99,6 @@ typedef struct coff_sym {
 #define IMAGE_SCN_MEM_READ               0x40000000
 #define IMAGE_SCN_MEM_WRITE              0x80000000
 
-/* -----------------------------------------------------------------
- * Symbol storage classes
- * ----------------------------------------------------------------- */
 #ifndef IMAGE_SYM_CLASS_EXTERNAL
 #  define IMAGE_SYM_CLASS_EXTERNAL     0x02
 #endif
@@ -146,9 +115,6 @@ typedef struct coff_sym {
 #  define IMAGE_SYM_CLASS_SECTION 0x0068
 #endif
 
-/* -----------------------------------------------------------------
- * Error codes
- * ----------------------------------------------------------------- */
 typedef enum {
     COFF_SUCCESS                  =  0,
     COFF_ERR_NULL_ARG             = -1,
@@ -176,16 +142,8 @@ typedef enum {
 
 const char* CoffErrorString(coff_error_t err);
 
-/* -----------------------------------------------------------------
- * Default BOF execution timeout (milliseconds).
- * Override: CoffSetTimeout(ms) before calling CoffRun / CoffRunBOF.
- * Set to INFINITE (0xFFFFFFFF) to disable the watchdog.
- * ----------------------------------------------------------------- */
 #define COFF_DEFAULT_TIMEOUT_MS  30000u
 
-/* -----------------------------------------------------------------
- * Allocator back-end
- * ----------------------------------------------------------------- */
 typedef void* (*coff_alloc_fn)(size_t size, void* user_ctx);
 typedef void  (*coff_free_fn)(void*  ptr,   void* user_ctx);
 
@@ -197,9 +155,6 @@ typedef struct {
 
 extern const coff_allocator_t g_coff_default_allocator;
 
-/* -----------------------------------------------------------------
- * Section allocation record (one per COFF section)
- * ----------------------------------------------------------------- */
 typedef struct {
     void*    base_alloc;      /* raw VirtualAlloc base (before leading guard) */
     size_t   base_size;       /* total raw allocation size inc. guard pages   */
@@ -208,9 +163,6 @@ typedef struct {
     uint32_t characteristics;
 } coff_section_t;
 
-/* -----------------------------------------------------------------
- * Loader context
- * ----------------------------------------------------------------- */
 #define COFF_MAX_SECTIONS 96
 
 typedef struct {
@@ -235,10 +187,6 @@ typedef struct {
     uint32_t         tramp_next[COFF_MAX_SECTIONS];
 } coff_ctx_t;
 
-/* -----------------------------------------------------------------
- * Lifecycle management
- * ----------------------------------------------------------------- */
-
 /**
  * CoffLoaderInit  –  must be called once before any other API.
  *   Initialises the private heap, critical section, and resolves
@@ -258,10 +206,6 @@ void CoffLoaderTeardown(void);
  *   @param ms  Timeout in milliseconds. INFINITE disables the watchdog.
  */
 void CoffSetTimeout(uint32_t ms);
-
-/* -----------------------------------------------------------------
- * Public loader API
- * ----------------------------------------------------------------- */
 
 coff_error_t CoffLoad(
     const uint8_t*          coff_data,
@@ -300,9 +244,6 @@ coff_error_t CoffRunBOF(
  */
 void* CoffResolveExport(const char* lib_name, const char* func_name);
 
-/* -----------------------------------------------------------------
- * Utilities
- * ----------------------------------------------------------------- */
 unsigned char* unhexlify(const unsigned char* value, int* outlen);
 unsigned char* getFileContents(const char* filepath, uint32_t* outsize);
 

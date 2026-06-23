@@ -63,9 +63,6 @@
 #include <windows.h>
 #include "loader/beacon_compatibility.h"
 
-/* =========================================================================
- * Arch-specific process paths
- * ========================================================================= */
 #define DEFAULTPROCESSNAME  "rundll32.exe"
 #ifdef _WIN64
 #  define X86PATH  "SysWOW64"
@@ -75,16 +72,6 @@
 #  define X64PATH  "sysnative"
 #endif
 
-/* =========================================================================
- * Obfuscated Win32 name helpers
- * =========================================================================
- * Strings that name GetProcAddress, LoadLibraryA etc. are XOR'd with 0x55
- * so they do not appear as plaintext in the .rdata section.  They are
- * decoded once into a private heap block during InitInternalFunctions().
- *
- * To add a new name: encode it with the same XOR key and put it in the
- * obf_names[] table below.
- * ========================================================================= */
 #define OBF_KEY  0x55u
 
 /* XOR each byte of a string literal with OBF_KEY at compile time.
@@ -140,13 +127,6 @@ static char* g_name_GetModuleHandleA = NULL;
 static char* g_name_FreeLibrary      = NULL;
 static char* g_name_kernel32         = NULL;
 
-/* =========================================================================
- * Internal-function dispatch table
- * =========================================================================
- * Slots 23-26 hold the Win32 kernel32 stubs.  Their name pointers and
- * function pointers are filled at runtime by InitInternalFunctions().
- * Slot 29 = __C_specific_handler, set by CoffLoaderInit().
- * ========================================================================= */
 unsigned char* InternalFunctions[30][2] = {
     { (unsigned char*)"BeaconDataParse",             (unsigned char*)BeaconDataParse             },
     { (unsigned char*)"BeaconDataInt",               (unsigned char*)BeaconDataInt               },
@@ -235,13 +215,6 @@ void InitInternalFunctions(void) {
     fprintf(stderr, "[D] InitInternalFunctions done\n"); fflush(stderr);
 }
 
-/* =========================================================================
- * Output buffer – encrypted at rest
- * =========================================================================
- * Layout: g_out_buf[0 .. g_out_offset-1] is always ciphertext.
- * g_out_size tracks the number of plaintext bytes accumulated (same value
- * as g_out_offset since we always append).
- * ========================================================================= */
 static char*    g_out_buf     = NULL;
 static int      g_out_size    = 0;
 static int      g_out_offset  = 0;
@@ -307,9 +280,6 @@ static void out_append(const char* data, int len) {
     out_xor(g_out_buf, g_out_offset, g_out_key, 0);
 }
 
-/* =========================================================================
- * Format-buffer canary
- * ========================================================================= */
 #define FORMAT_CANARY_VALUE  UINT64_C(0xDEADBEEFCAFEBABE)
 #define FORMAT_CANARY_SIZE   8
 
@@ -344,9 +314,6 @@ static void fmt_canary_fail(const char* where) {
     abort();
 }
 
-/* =========================================================================
- * Endianness
- * ========================================================================= */
 static uint32_t swap_endianess(uint32_t in) {
     uint32_t probe = 0xAABBCCDD;
     if (((unsigned char*)&probe)[0] == 0xDD)
@@ -355,24 +322,6 @@ static uint32_t swap_endianess(uint32_t in) {
     return in;
 }
 
-/* =========================================================================
- * Data-parser API
- * =========================================================================
- *
- * FIX-PARSE: The original code unconditionally did:
- *
- *     parser->buffer = buffer + 4;
- *     parser->length = size - 4;
- *
- * When the caller passes a raw arg buffer from unhexlify() (no length
- * prefix), size may be < 4, making buffer+4 point past the end.
- *
- * New behaviour:
- *   size >= 4  – Cobalt Strike wire format: skip 4-byte length prefix.
- *   0 <= size < 4 – treat as raw byte buffer with no prefix; parser starts
- *                   at buffer[0] with the full length.
- *   size <= 0  – initialise to empty, valid state (length = 0).
- * ========================================================================= */
 void BeaconDataParse(datap* parser, char* buffer, int size) {
     if (!parser) return;
     if (!buffer || size <= 0) {
@@ -430,9 +379,6 @@ char* BeaconDataExtract(datap* parser, int* size) {
     return out;
 }
 
-/* =========================================================================
- * Format API  (with canary + safe abort on overwrite)
- * ========================================================================= */
 void BeaconFormatAlloc(formatp* format, int maxsz) {
     if (!format || maxsz <= 0) return;
     format->original = (char*)calloc((size_t)maxsz + FORMAT_CANARY_SIZE, 1);
@@ -511,9 +457,6 @@ void BeaconFormatInt(formatp* format, int value) {
     format->length += 4;
 }
 
-/* =========================================================================
- * Output API  (encrypted at rest)
- * ========================================================================= */
 void BeaconPrintf(int type, char* fmt, ...) {
     (void)type;
     if (!fmt) return;
@@ -587,9 +530,6 @@ char* BeaconGetOutputData(int* outsize) {
     return out;
 }
 
-/* =========================================================================
- * Token API
- * ========================================================================= */
 BOOL BeaconUseToken(HANDLE token) { return SetThreadToken(NULL, token); }
 
 void BeaconRevertToken(void) { RevertToSelf(); }
@@ -607,9 +547,6 @@ BOOL BeaconIsAdmin(void) {
     return is_admin;
 }
 
-/* =========================================================================
- * Spawn / inject
- * ========================================================================= */
 void BeaconGetSpawnTo(BOOL x86, char* buffer, int length) {
     if (!buffer || length <= 0) return;
     const char* path = x86

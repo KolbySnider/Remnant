@@ -1,6 +1,5 @@
 #include "base.h"
 
-
 void go(char* args, int len) {
     if (!bofstart()) return;
 

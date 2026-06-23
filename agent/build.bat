@@ -117,6 +117,10 @@ echo   loader\COFFLoader.c
 x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\loader\COFFLoader.c -o "%OBJ_LOADER%\COFFLoader.obj"
 if !errorlevel! neq 0 (echo [!] Failed: loader\COFFLoader.c && exit /b 1)
 
+echo   core\package.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\core\package.c -o "%OBJ_CORE%\package.obj"
+if !errorlevel! neq 0 (echo [!] Failed: core\package.c && exit /b 1)
+
 :: ---------------------------------------------------------------------------
 :: 2. BOFs
 ::    BOFs need both agent headers (beacon_compatibility.h) and the BOF-side
@@ -144,6 +148,7 @@ x86_64-w64-mingw32-gcc ^
   "%OBJ_TRANSPORT%\http.obj" ^
   "%OBJ_MODULES%\shell.obj" ^
   "%OBJ_CORE%\beacon.obj" ^
+  "%OBJ_CORE%\package.obj" ^
   "%OBJ_LOADER%\beacon_compatibility.obj" ^
   "%OBJ_LOADER%\COFFLoader.obj" ^
   -o "%BUILD_DIR%\%ARG_OUT%" ^

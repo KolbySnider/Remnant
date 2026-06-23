@@ -55,31 +55,19 @@
 /* For MIB_IPNETTABLE, MIB_TCPTABLE, GetIpNetTable, GetTcpTable */
 #include <iphlpapi.h>
 
-/* =========================================================================
- * Ensure BOF-mode is on when compiling a BOF translation unit.
- * ========================================================================= */
 #ifndef BOF
 #  define BOF
 #endif
 
-/* =========================================================================
- * Callback type constants  (match Cobalt Strike values)
- * ========================================================================= */
 #define CALLBACK_OUTPUT       0
 #define CALLBACK_ERROR        0x0d
 #define CALLBACK_OUTPUT_OEM   0x1e
 #define CALLBACK_OUTPUT_UTF8  0x20
 
-/* =========================================================================
- * intAlloc / intFree / intZeroMemory
- * ========================================================================= */
 #define intAlloc(size)           HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size))
 #define intFree(addr)            HeapFree(GetProcessHeap(), 0, (addr))
 #define intZeroMemory(addr,size) SecureZeroMemory((addr),(size))
 
-/* =========================================================================
- * MSVCRT$ thunks
- * ========================================================================= */
 #define MSVCRT$calloc        calloc
 #define MSVCRT$malloc        malloc
 #define MSVCRT$realloc       realloc
@@ -119,15 +107,6 @@
 #define MSVCRT$wcscmp        wcscmp
 #define MSVCRT$_wcsicmp      _wcsicmp
 
-/* =========================================================================
- * Kernel32$ thunks  (mixed-case — original TrustedSec loader style)
- * KERNEL32$ thunks  (all-caps   — used by most TrustedSec BOFs)
- *
- * Both sets map to the same real Win32 function.  Define mixed-case first,
- * then alias all-caps to mixed-case so there is only one real definition.
- * ========================================================================= */
-
-/* --- mixed-case Kernel32$ --- */
 #define Kernel32$GetProcessHeap            GetProcessHeap
 #define Kernel32$HeapAlloc                 HeapAlloc
 #define Kernel32$HeapFree                  HeapFree
@@ -234,7 +213,6 @@
 #define Kernel32$GetThreadContext          GetThreadContext
 #define Kernel32$OpenProcessToken          OpenProcessToken
 
-/* --- all-caps KERNEL32$ aliases — point to the mixed-case defines above --- */
 #define KERNEL32$GetProcessHeap            Kernel32$GetProcessHeap
 #define KERNEL32$HeapAlloc                 Kernel32$HeapAlloc
 #define KERNEL32$HeapFree                  Kernel32$HeapFree
@@ -341,9 +319,6 @@
 #define KERNEL32$GetThreadContext          Kernel32$GetThreadContext
 #define KERNEL32$OpenProcessToken          Kernel32$OpenProcessToken
 
-/* =========================================================================
- * NTDLL$ thunks
- * ========================================================================= */
 #define NTDLL$RtlAllocateHeap       RtlAllocateHeap
 #define NTDLL$RtlFreeHeap           RtlFreeHeap
 #define NTDLL$RtlZeroMemory         RtlZeroMemory
@@ -355,18 +330,9 @@
 #define NTDLL$NtQueryInformationProcess NtQueryInformationProcess
 #define NTDLL$NtQueryInformationThread  NtQueryInformationThread
 
-/* =========================================================================
- * SECUR32$ thunks
- * Requires linking with -lsecur32.
- * GetUserNameExA / GetUserNameExW live in secur32.dll.
- * ========================================================================= */
 #define SECUR32$GetUserNameExA      GetUserNameExA
 #define SECUR32$GetUserNameExW      GetUserNameExW
 
-/* =========================================================================
- * IPHLPAPI$ thunks
- * Requires linking with -liphlpapi.
- * ========================================================================= */
 #define IPHLPAPI$GetIpNetTable      GetIpNetTable
 #define IPHLPAPI$GetIpNetTable2     GetIpNetTable2
 #define IPHLPAPI$GetTcpTable        GetTcpTable
@@ -379,10 +345,6 @@
 #define IPHLPAPI$GetIpAddrTable     GetIpAddrTable
 #define IPHLPAPI$GetIpForwardTable  GetIpForwardTable
 
-/* =========================================================================
- * WS2_32$ thunks
- * Requires linking with -lws2_32.
- * ========================================================================= */
 #define WS2_32$inet_ntoa            inet_ntoa
 #define WS2_32$inet_addr            inet_addr
 #define WS2_32$htons                htons
@@ -400,9 +362,6 @@
 #define WS2_32$getaddrinfo          getaddrinfo
 #define WS2_32$freeaddrinfo         freeaddrinfo
 
-/* =========================================================================
- * ADVAPI32$ thunks
- * ========================================================================= */
 #define ADVAPI32$OpenProcessToken       OpenProcessToken
 #define ADVAPI32$GetTokenInformation    GetTokenInformation
 #define ADVAPI32$LookupAccountSidA      LookupAccountSidA
@@ -427,9 +386,6 @@
 #define ADVAPI32$ConvertSidToStringSidA ConvertSidToStringSidA
 #define ADVAPI32$ConvertSidToStringSidW ConvertSidToStringSidW
 
-/* =========================================================================
- * Data-parser types and API
- * ========================================================================= */
 typedef struct {
     char* original;
     char* buffer;
@@ -443,9 +399,6 @@ short BeaconDataShort(datap* parser);
 int   BeaconDataLength(datap* parser);
 char* BeaconDataExtract(datap* parser, int* size);
 
-/* =========================================================================
- * Format-buffer types and API
- * ========================================================================= */
 typedef struct {
     char* original;
     char* buffer;
@@ -461,16 +414,10 @@ void  BeaconFormatPrintf(formatp* format, char* fmt, ...);
 char* BeaconFormatToString(formatp* format, int* size);
 void  BeaconFormatInt(formatp* format, int value);
 
-/* =========================================================================
- * Output API
- * ========================================================================= */
 void  BeaconPrintf(int type, char* fmt, ...);
 void  BeaconOutput(int type, char* data, int len);
 char* BeaconGetOutputData(int* outsize);
 
-/* =========================================================================
- * Token / admin / process API
- * ========================================================================= */
 BOOL  BeaconUseToken(HANDLE token);
 void  BeaconRevertToken(void);
 BOOL  BeaconIsAdmin(void);
@@ -486,15 +433,8 @@ void  BeaconInjectTemporaryProcess(PROCESS_INFORMATION* pInfo,
 void  BeaconCleanupProcess(PROCESS_INFORMATION* pInfo);
 BOOL  toWideChar(char* src, wchar_t* dst, int max);
 
-/* =========================================================================
- * Hardened loader export resolver  (implemented in COFFLoader.c)
- * ========================================================================= */
 void* CoffResolveExport(const char* lib_name, const char* func_name);
 
-/* =========================================================================
- * InitInternalFunctions  (implemented in beacon_compatibility.c)
- * Called once from CoffLoaderInit().
- * ========================================================================= */
 void InitInternalFunctions(void);
 
 #endif /* _WIN32 */

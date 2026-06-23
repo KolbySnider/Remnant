@@ -8,29 +8,27 @@
 #include "transport/http.h"
 #include "config.h"
 
-// ---------------------------------------------------------------------------
-// SESSION_KEY — written once by derive_session_key(), read by crypto.c
-// ---------------------------------------------------------------------------
 uint8_t SESSION_KEY[32] = {0};
 
-// ---------------------------------------------------------------------------
-// BCrypt RNG
-// ---------------------------------------------------------------------------
 void gen_random_bytes(uint8_t *buf, size_t len) {
     BCRYPT_ALG_HANDLE hAlg;
     if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_RNG_ALGORITHM, NULL, 0) == 0) {
         BCryptGenRandom(hAlg, buf, (ULONG)len, 0);
         BCryptCloseAlgorithmProvider(hAlg, 0);
     } else {
-        // fallback — should never be reached on any supported Windows version
+        /* fallback — BCryptRNG unavailable */
         for (size_t i = 0; i < len; i++)
             buf[i] = (uint8_t)(rand() & 0xFF);
     }
 }
 
-// ---------------------------------------------------------------------------
-// SHA-256 via BCrypt — KDF: SESSION_KEY = SHA-256(ECDH shared secret)
-// ---------------------------------------------------------------------------
+/**
+ * @brief SHA-256 a buffer via BCrypt.
+ * @param data     Input bytes.
+ * @param data_len Input length.
+ * @param out      32-byte output buffer.
+ * @return 0 on success, -1 on failure.
+ */
 static int bcrypt_sha256(const uint8_t *data, ULONG data_len, uint8_t out[32]) {
     BCRYPT_ALG_HANDLE  hAlg  = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
@@ -52,18 +50,14 @@ cleanup:
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// ECDH-P256 helpers
-// ---------------------------------------------------------------------------
-
 int import_peer_pubkey(const uint8_t peer_x962[65], BCRYPT_KEY_HANDLE *hKey_out) {
-    // Build BCRYPT_ECCKEY_BLOB: [magic(4)][cbKey(4)][X(32)][Y(32)]
+    /* Build BCRYPT_ECCKEY_BLOB: [magic(4)][cbKey(4)][X(32)][Y(32)] */
     uint8_t  blob[8 + 64];
-    uint32_t magic = 0x314B4345u;  // BCRYPT_ECDH_PUBLIC_P256_MAGIC
+    uint32_t magic = 0x314B4345u;  /* BCRYPT_ECDH_PUBLIC_P256_MAGIC */
     uint32_t cbKey = 32;
     memcpy(blob,     &magic, 4);
     memcpy(blob + 4, &cbKey, 4);
-    memcpy(blob + 8, peer_x962 + 1, 64);  // skip 0x04 prefix
+    memcpy(blob + 8, peer_x962 + 1, 64);  /* skip 0x04 prefix */
 
     BCRYPT_ALG_HANDLE hAlg = NULL;
     int result = -1;
@@ -102,7 +96,7 @@ int gen_ecdh_keypair(BCRYPT_KEY_HANDLE *hPrivKey_out, uint8_t our_pub_x962[65]) 
         goto cleanup;
     }
 
-    // Export public key as BCRYPT_ECCKEY_BLOB, then convert to X9.62
+    /* Export as BCRYPT_ECCKEY_BLOB, then reformat to X9.62 */
     uint8_t blob[8 + 64];
     ULONG   blob_len = 0;
     if (!BCRYPT_SUCCESS(BCryptExportKey(*hPrivKey_out, NULL, BCRYPT_ECCPUBLIC_BLOB,
@@ -149,12 +143,12 @@ int derive_session_key(BCRYPT_KEY_HANDLE hPrivKey, BCRYPT_KEY_HANDLE hPeerPub) {
         goto cleanup;
     }
 
-    // BCrypt BCRYPT_KDF_RAW_SECRET returns the ECDH X coordinate in little-endian
-    // order, but the Python `cryptography` library (and the RFC) use big-endian.
-    // Reverse the bytes so both sides SHA-256 the same value and derive the same key.
+    /* BCrypt returns the X coordinate little-endian; Python's cryptography
+     * library returns it big-endian. Reverse before hashing so both sides
+     * compute the same SESSION_KEY. */
     for (ULONG i = 0; i < raw_len / 2; i++) {
-        uint8_t tmp     = raw[i];
-        raw[i]          = raw[raw_len - 1 - i];
+        uint8_t tmp          = raw[i];
+        raw[i]               = raw[raw_len - 1 - i];
         raw[raw_len - 1 - i] = tmp;
     }
 
@@ -174,9 +168,6 @@ cleanup:
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Registration handshake
-// ---------------------------------------------------------------------------
 int do_register(char *agent_id, int agent_id_size) {
     BCRYPT_KEY_HANDLE hPriv    = NULL;
     BCRYPT_KEY_HANDLE hPeerPub = NULL;

@@ -1,6 +1,5 @@
 #include "base.h"
 
-
 /* Build a "%llu B/KB/MB/GB" string without depending on MSVCRT$sprintf
  * (which pulls in __mingw_vsprintf — not exported by any DLL). */
 static void format_size(unsigned long long sz, char* out, int outsz) {

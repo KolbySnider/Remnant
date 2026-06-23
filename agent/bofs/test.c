@@ -1,6 +1,5 @@
 #include "base.h"
 
-
 void go(char* args, int len) {
     /*
      * bofstart() MUST be the first call in go().

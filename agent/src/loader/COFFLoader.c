@@ -19,18 +19,12 @@
 
 #include "loader/COFFLoader.h"
 
-/* =========================================================================
- * Debug helpers
- * ========================================================================= */
 #ifdef DEBUG
 #  define DBG(fmt, ...)  fprintf(stderr, "[COFF] " fmt "\n", ##__VA_ARGS__)
 #else
 #  define DBG(fmt, ...)  ((void)0)
 #endif
 
-/* =========================================================================
- * Architecture-specific import prefix
- * ========================================================================= */
 #if defined(__x86_64__) || defined(_WIN64)
 #  define IMPORT_PREFIX      "__imp_"
 #  define IMPORT_PREFIX_LEN  6u
@@ -39,17 +33,8 @@
 #  define IMPORT_PREFIX_LEN  7u
 #endif
 
-/* =========================================================================
- * Page size for guard pages
- * ========================================================================= */
 #define PAGE_SIZE_BYTES  4096u
 
-/* =========================================================================
- * Global initialisation state
- * =========================================================================
- * g_loader_ready: 0 = uninitialised, 2 = ready.
- * All API functions except CoffLoaderInit check this first.
- * ========================================================================= */
 #if defined(_WIN32)
 static CRITICAL_SECTION  g_cs;
 static HANDLE            g_private_heap = NULL;
@@ -64,14 +49,8 @@ static volatile uint32_t g_timeout_ms   = COFF_DEFAULT_TIMEOUT_MS;
 #define REQUIRE_INIT_VOID() \
     do { if (InterlockedCompareExchange(&g_loader_ready, 2, 2) != 2) return; } while(0)
 
-/**
- * @brief Acquire the loader-wide critical section.
- */
 static void cs_lock(void)   { EnterCriticalSection(&g_cs); }
 
-/**
- * @brief Release the loader-wide critical section.
- */
 static void cs_unlock(void) { LeaveCriticalSection(&g_cs); }
 
 /**
@@ -128,7 +107,6 @@ static void  priv_free(void* p)    { free(p); }
  */
 coff_error_t CoffLoaderInit(void) {
 #if defined(_WIN32)
-    // fprintf(stderr, "[D] CoffLoaderInit entry\n"); fflush(stderr);
     /* Atomically claim the init slot */
     if (InterlockedCompareExchange(&g_loader_ready, 1, 0) != 0) {
         /* Already initialised or being initialised by another thread */
@@ -143,10 +121,8 @@ coff_error_t CoffLoaderInit(void) {
         InterlockedExchange(&g_loader_ready, 0);
         return COFF_ERR_ALLOC_FAIL;
     }
-    // fprintf(stderr, "[D] HeapCreate done: %p\n", g_private_heap); fflush(stderr);
 
     InitializeCriticalSectionAndSpinCount(&g_cs, 4000);
-    // fprintf(stderr, "[D] CS init done\n"); fflush(stderr);
 
     /*
      * __C_specific_handler / _except_handler4 are compiler-internal symbols.
@@ -161,16 +137,12 @@ coff_error_t CoffLoaderInit(void) {
 #else
     FARPROC csh = (FARPROC)_except_handler4;
 #endif
-    // fprintf(stderr, "[D] csh=%p\n", (void*)csh); fflush(stderr);
 
     /* Store into the compatibility table */
     extern unsigned char* InternalFunctions[30][2];
     InternalFunctions[29][1] = (unsigned char*)(void*)csh;
-
-    // fprintf(stderr, "[D] CSH stored, calling InitInternalFunctions\n"); fflush(stderr);
     extern void InitInternalFunctions(void);
     InitInternalFunctions();
-    // fprintf(stderr, "[D] InitInternalFunctions returned\n"); fflush(stderr);
 
     InterlockedExchange(&g_loader_ready, 2);
     return COFF_SUCCESS;
@@ -397,9 +369,6 @@ static void default_free(void* ptr, void* user_ctx) {
 
 const coff_allocator_t g_coff_default_allocator = { default_alloc, default_free, NULL };
 
-/* =========================================================================
- * Import cache
- * ========================================================================= */
 typedef struct {
     uint32_t name_hash;
     void*    enc_address;
@@ -470,9 +439,6 @@ typedef struct _MY_PEB {
 
 #endif /* _WIN32 */
 
-/* =========================================================================
- * Hash-based PE export resolution (no plaintext GetProcAddress)
- * ========================================================================= */
 #if defined(_WIN32)
 /* Forward declaration for forwarder recursion. */
 static void* find_export_by_hash(HMODULE hmod, uint32_t func_hash);
@@ -695,23 +661,6 @@ static bool str_pfx(const char* s, const char* p) {
     return strncmp(s, p, strlen(p)) == 0;
 }
 
-/* =========================================================================
- * REL32 trampoline allocator
- * =========================================================================
- * For bare-name external REL32 relocations we cannot point the displacement
- * at the GOT slot (the BOF would execute the GOT bytes as instructions).
- * Instead we write a 14-byte trampoline somewhere within ±2GB of the patch
- * site and point the REL32 at that.
- *
- * The trampoline area lives in the slack space at the end of each section's
- * page-aligned allocation: section data is sh->SizeOfRawData bytes, exec_size
- * is rounded up to a page (often 4096), giving (exec_size - SizeOfRawData)
- * bytes of free space.  Since the trampolines sit in the section memory,
- * the existing XOR-encryption + VirtualProtect lifecycle covers them for free.
- *
- * Per section we track next_tramp_offset, which starts at SizeOfRawData and
- * grows toward exec_size.  Each trampoline takes 16 bytes.
- * ========================================================================= */
 #define TRAMP_BYTES 16
 
 typedef struct {
@@ -942,9 +891,6 @@ static void reimport_encrypt_all(coff_ctx_t* ctx, uint64_t key) {
         ctx->import_table[i] = encrypt_ptr(ctx->import_table[i], key);
 }
 
-/* =========================================================================
- * Bounds-check macro
- * ========================================================================= */
 #define BOUNDS_CHECK(off, sz, fsz, err) \
     do { if ((uint64_t)(off)+(uint64_t)(sz) > (uint64_t)(fsz)) return (err); } while(0)
 
@@ -1171,15 +1117,12 @@ coff_error_t CoffLoad(
                         uint8_t* tr = alloc_trampoline(ctx, s,
                             &ctx->tramp_next[s], resolved);
                         if (!tr) RELOC_FAIL(COFF_ERR_ALLOC_FAIL);
-                        // fprintf(stderr, "[TR] sym='%s' resolved=%p tramp=%p target_in_tramp=%p\n",
                         //     sym_name, resolved, (void*)tr, *(void**)(tr+6));
                         // fflush(stderr);
                         target = tr;
                     }
                 }
             } else { RELOC_FAIL(COFF_ERR_SYMBOL_UNRESOLVED); }
-
-            // fprintf(stderr, "[R%u/%u] sect=%u +0x%X type=%u sym='%s' symsect=%d defined=%d external=%d target=%p\n",
             //         r, sh->NumberOfRelocations, s, rel->VirtualAddress, rel->Type,
             //         sym_name, sym->SectionNumber, sym_defined, sym_external, target);
             // fflush(stderr);
@@ -1304,9 +1247,6 @@ static DWORD section_prot_from_chars(uint32_t ch) {
 }
 #endif
 
-/* =========================================================================
- * Watchdog thread context
- * ========================================================================= */
 #if defined(_WIN32)
 typedef struct {
     void   (*entry)(char*, unsigned long);
@@ -1404,9 +1344,7 @@ coff_error_t CoffRun(
             uint16_t si = (uint16_t)(sym->SectionNumber - 1);
             if (si >= ctx->section_count) return COFF_ERR_ENTRY_NOT_FOUND;
 
-            /* ----------------------------------------------------------
-             * Step 1: Open all sections for writing so we can decrypt.
-             * ---------------------------------------------------------- */
+            
 #if defined(_WIN32)
             for (uint16_t i = 0; i < ctx->section_count; i++) {
                 if (!ctx->sections[i].exec_ptr) continue;
@@ -1417,9 +1355,7 @@ coff_error_t CoffRun(
             }
 #endif
 
-            /* ----------------------------------------------------------
-             * Step 2 & 3: Decrypt sections and GOT.
-             * ---------------------------------------------------------- */
+            
             for (uint16_t i = 0; i < ctx->section_count; i++) {
                 if (ctx->sections[i].exec_ptr)
                     xor_crypt((uint8_t*)ctx->sections[i].exec_ptr,
@@ -1428,13 +1364,7 @@ coff_error_t CoffRun(
             for (uint32_t g = 0; g < ctx->import_count; g++)
                 ctx->import_table[g] = decrypt_ptr(ctx->import_table[g], runtime_key);
 
-            /* ----------------------------------------------------------
-             * Step 4: Make the entry section executable (but not writable).
-             *         All other sections retain PAGE_READWRITE for now;
-             *         they may be data sections the BOF writes to.
-             *         Sections that are execute+read have their protection
-             *         set individually here.
-             * ---------------------------------------------------------- */
+            
 #if defined(_WIN32)
             for (uint16_t i = 0; i < ctx->section_count; i++) {
                 if (!ctx->sections[i].exec_ptr) continue;
@@ -1458,9 +1388,7 @@ coff_error_t CoffRun(
 
             coff_error_t run_rc = COFF_SUCCESS;
 
-            /* ----------------------------------------------------------
-             * Step 5: Execute.
-             * ---------------------------------------------------------- */
+            
 #if defined(_WIN32)
             uint32_t tmo = (uint32_t)InterlockedCompareExchange(
                 (LONG*)&g_timeout_ms, 0, 0);
@@ -1486,20 +1414,13 @@ coff_error_t CoffRun(
                 wa->entry   = entry;
                 wa->argdata = (char*)argdata;
                 wa->argsize = (unsigned long)argsize;
-
-                // fprintf(stderr, "[CR] before CreateThread\n"); fflush(stderr);
                 HANDLE hthread = CreateThread(NULL, 0, bof_thread_proc, wa, 0, NULL);
-                // fprintf(stderr, "[CR] hthread=%p\n", (void*)hthread); fflush(stderr);
                 if (!hthread) {
                     /* Thread creation failed — fall back to direct call */
                     free(wa);
-                    // fprintf(stderr, "[CR] direct entry call\n"); fflush(stderr);
                     entry((char*)argdata, (unsigned long)argsize);
-                    // fprintf(stderr, "[CR] direct entry returned\n"); fflush(stderr);
                 } else {
-                    // fprintf(stderr, "[CR] waiting %u ms\n", tmo); fflush(stderr);
                     DWORD wait = WaitForSingleObject(hthread, tmo);
-                    // fprintf(stderr, "[CR] wait=%lu\n", wait); fflush(stderr);
                     if (wait == WAIT_TIMEOUT) {
                         TerminateThread(hthread, 1);
                         run_rc = COFF_ERR_TIMEOUT;
@@ -1515,11 +1436,7 @@ coff_error_t CoffRun(
             cs_unlock();
 #endif
 
-            /* ----------------------------------------------------------
-             * Steps 6-9: Re-open writable, re-encrypt, restore
-             *            protections.  Done unconditionally even on timeout
-             *            so we never leave plaintext executable sections.
-             * ---------------------------------------------------------- */
+            
 #if defined(_WIN32)
             for (uint16_t i = 0; i < ctx->section_count; i++) {
                 if (!ctx->sections[i].exec_ptr) continue;
@@ -1650,17 +1567,14 @@ coff_error_t CoffRunBOF(
 {
     coff_ctx_t* ctx = NULL;
     coff_error_t rc = CoffLoad(coff_data, filesize, allocator, &ctx);
-    // fprintf(stderr, "[H] CoffLoad rc=%d (%s)\n", rc, CoffErrorString(rc));
     // fflush(stderr);
     if (rc != COFF_SUCCESS) return rc;
 
     rc = CoffApplyProtections(ctx);
-    // fprintf(stderr, "[H] CoffApplyProtections rc=%d (%s)\n", rc, CoffErrorString(rc));
     // fflush(stderr);
     if (rc != COFF_SUCCESS) { CoffFree(&ctx); return rc; }
 
     rc = CoffRun(ctx, functionname, coff_data, filesize, argdata, argsize);
-    // fprintf(stderr, "[H] CoffRun rc=%d (%s)\n", rc, CoffErrorString(rc));
     // fflush(stderr);
 
     CoffFree(&ctx);
@@ -1761,7 +1675,6 @@ unsigned char* getFileContents(const char* filepath, uint32_t* outsize) {
     return buf;
 }
 
-
 /**
  * @brief Vectored exception handler used by the standalone harness. Logs
  *        the fault code + address for genuine CPU exceptions and
@@ -1787,9 +1700,6 @@ static LONG WINAPI veh(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* =========================================================================
- * Standalone harness  (-DCOFF_STANDALONE)
- * ========================================================================= */
 #ifdef COFF_STANDALONE
 /**
  * @brief Standalone test driver. Loads a BOF from disk, optionally decodes
@@ -1824,7 +1734,6 @@ int main(int argc, char* argv[]) {
     unsigned char* args = NULL;
     if (argc >= 4 && argv[3])
         args = unhexlify((const unsigned char*)argv[3], &asz);
-
 
     rc = CoffRunBOF(argv[1], data, fsz, NULL, args, asz);
 

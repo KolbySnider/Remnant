@@ -49,9 +49,6 @@ void  printoutput(BOOL done);
 
 char* Utf16ToUtf8(const wchar_t* input);
 
-/* =========================================================================
- * BOF-mode implementations
- * ========================================================================= */
 #ifdef BOF
 
 int bofstart(void) {
@@ -145,9 +142,6 @@ void printoutput(BOOL done) {
     }
 }
 
-/* =========================================================================
- * DYNAMIC_LIB_COUNT support
- * ========================================================================= */
 #ifdef DYNAMIC_LIB_COUNT
 
 typedef struct loadedLibrary {
@@ -217,9 +211,6 @@ void bofstop(void) {
 #endif
 }
 
-/* =========================================================================
- * Non-BOF mode
- * ========================================================================= */
 #else  /* !BOF */
 
 #define internal_printf  printf
@@ -229,9 +220,6 @@ void bofstop(void) {
 
 #endif /* BOF */
 
-/* =========================================================================
- * Utf16ToUtf8
- * ========================================================================= */
 char* Utf16ToUtf8(const wchar_t* input) {
     if (!input) return NULL;
 

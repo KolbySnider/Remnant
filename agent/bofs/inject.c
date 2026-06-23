@@ -6,7 +6,6 @@
 #include "libc.h"
 #include "base.h"
 
-
 void go(char* argc, int len)
 {
 	datap parser;

