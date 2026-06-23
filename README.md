@@ -90,8 +90,44 @@ Beacons are built from the server's interactive CLI using the `generate` command
 ```
  > generate [--ip IP] [--port PORT] [--ua USER_AGENT] [--token AUTH_TOKEN]
             [--sleep MS] [--jitter MS] [--https] [--out filename.exe]
+Beacons are built from the server's interactive CLI using the `generate` command. The server invokes `agent/build.bat` with the supplied parameters and writes the output binary to `agent/build/`.
+
+**Prerequisites** (on the machine running the server):
+- `x86_64-w64-mingw32-gcc` on PATH (MinGW-w64)
+
+### generate command
+
+```
+ > generate [--ip IP] [--port PORT] [--ua USER_AGENT] [--token AUTH_TOKEN]
+            [--sleep MS] [--jitter MS] [--https] [--out filename.exe]
 ```
 
+All flags are optional. Defaults are pulled from the server's own listen address, port, and auth token.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ip` | server listen IP (or `127.0.0.1`) | C2 callback address baked into the beacon |
+| `--port` | server listen port | C2 callback port |
+| `--ua` | `Mozilla/5.0 (Windows NT 10.0; Win64; x64)...` | HTTP User-Agent header |
+| `--token` | server auth token | `X-C2-Token` header sent on registration |
+| `--sleep` | `5000` | Base checkin interval in milliseconds |
+| `--jitter` | `3000` | Symmetric jitter in milliseconds |
+| `--https` | off | Enable HTTPS (certificate validation is disabled) |
+| `--out` | `beacon.exe` | Output filename under `agent/build/` |
+
+### Examples
+
+```
+ > generate
+ > generate --ip 10.0.0.1 --port 443 --out implant.exe
+ > generate --ip 10.0.0.1 --port 443 --https --token MyToken123 --sleep 10000 --jitter 5000 --out beacon_https.exe
+```
+
+The server prints the final binary path on success:
+
+```
+ 12:00:00  BUILD  Building  beacon.exe  ip=10.0.0.1  port=443  https=False
+ 12:00:01  OK     Built  /path/to/agent/build/beacon.exe
 All flags are optional. Defaults are pulled from the server's own listen address, port, and auth token.
 
 | Flag | Default | Description |
@@ -123,8 +159,11 @@ The server prints the final binary path on success:
 Build output:
 - `agent/build/<filename>` — the beacon binary
 - `agent/build/bofs/*.obj` — compiled BOF modules (also copied to `server/bofs/`)
+- `agent/build/<filename>` — the beacon binary
+- `agent/build/bofs/*.obj` — compiled BOF modules (also copied to `server/bofs/`)
 
 ---
+
 
 ## Running
 
@@ -238,7 +277,3 @@ The COFFLoader implementation and BOF ecosystem are heavily inspired by TrustedS
 **[Havoc C2](https://github.com/HavocFramework/Havoc)**
 The wire protocol framing, command ID namespace conventions, and the batch-package architecture were influenced by Havoc's agent-server communication design. The `PKG_FLAG_BATCH` pattern for coalescing multiple task results into a single checkin is modeled after Havoc's packet batching approach.
 ---
-
-## License
-
-For research and authorized use only. See `LICENSE` for terms.
