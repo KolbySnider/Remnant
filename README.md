@@ -68,11 +68,6 @@ Tasks move through a typed queue, not raw command strings:
 ### Persistent agent state
 
 Agent sessions — session key, task history, output, stats — get serialized to `agents.json` and reloaded on restart. You can kill and bring the server back without losing active sessions, as long as the beacon reconnects within its retry window.
-
-### Jittered sleep
-
-`sleep_ms = BASE_MS + rand() % (JITTER_MS * 2) - JITTER_MS`, floored at 1 second. Compile-time defaults are 5000ms base, 3000ms jitter.
-
 ---
 
 ## Requirements
