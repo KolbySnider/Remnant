@@ -251,6 +251,12 @@ void go(char *args, int len) {
     bofstop();
 }
 ```
+## TODO (maybe)
+1. Indirect syscalls: help with not being detected by userland hooks
+2. Sleep obfuscation: Implement either ekko or foliage sleep or an adhoc version of both
+3. Persistence: Should be easy enough to add just lazy
+4. Token manipulation
+5. process injection
 
 ---
 
@@ -258,6 +264,6 @@ void go(char *args, int len) {
 
 This builds on a few open-source projects worth calling out:
 
-**[TrustedSec](https://github.com/trustedsec)** — the COFFLoader and the broader BOF design here lean heavily on TrustedSec's open tooling. The `beacon_compatibility` shim's KERNEL32$, ADVAPI32$, NTDLL$, etc. thunk definitions come directly from their BOF headers, and the included BOF modules follow their authoring conventions.
+**[TrustedSec](https://github.com/trustedsec)** — the COFFLoader and the broader BOF design 
 
 **[Havoc C2](https://github.com/HavocFramework/Havoc)** — the wire protocol framing, the command ID layout, and the batch-package idea were all influenced by Havoc's agent-server design.
