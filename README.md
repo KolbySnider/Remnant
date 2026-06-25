@@ -207,7 +207,7 @@ The server packs these in BeaconPack format before embedding them in the task pa
 
 ### Writing your own
 
-BOFs are standard COFF objects compiled with `gcc -c`. They export `go(char *args, int len)` and use the `BeaconData*` API to parse arguments and `BeaconPrintf` / `BeaconOutput` to produce output. Drop the compiled `.obj` into `server/bofs/` and it's available via `bof` immediately. Make sure to `#include "base.h"` for the Win32 declarations or else the COFFLoader will not be able to resolve the symbol at load time.
+BOFs are standard COFF objects compiled with `gcc -c`. They export `go(char *args, int len)` and use the `BeaconData*` API to parse arguments and `BeaconPrintf` / `BeaconOutput` to produce output. Drop the compiled `.obj` into `server/bofs/` and it's available via `bof` immediately. Make sure to `#include "base.h"` for the Win32 forward-declarations. The `LIBRARY$Function` naming is what tells the COFFLoader to resolve them at load time.
 
 ```c
 #include "base.h"
