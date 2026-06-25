@@ -10,25 +10,6 @@ A small C2 framework. Python server with an interactive CLI, Windows beacon in C
 
 ## Features
 
-### Custom binary protocol
-
-All agent traffic uses a binary wire format. The first 24 bytes are plaintext so the server can route packets without touching the crypto; everything after that is AES-256-GCM.
-
-```
-Offset  Size  Field
-──────  ────  ──────────────────────────────────────────────
-  0      4    length      (bytes after this field, big-endian)
-  4      4    magic       (0xDEADBEEF — wire format guard)
-  8      2    version     (protocol version)
- 10      2    flags       (ENCRYPTED | BATCH | ERROR | FRAGMENT)
- 12      4    agent_id    (djb2 hash of agent UUID for routing)
- 16      4    command     (PKG_CMD_* identifier)
- 20      4    request_id  (ties task → result for correlation)
- 24    ...    payload     (AES-256-GCM encrypted when flagged)
-```
-
-Command IDs are grouped by range: lifecycle in `0x0001–0x00FF`, tasking in `0x0100–0x01FF`, BOF/loader in `0x0400–0x04FF`. The batch flag lets you coalesce multiple sub-packages into a single checkin.
-
 ### ECDH-P256 key exchange
 
 On first contact the beacon spins up an ephemeral ECDH-P256 keypair, sends the 65-byte uncompressed public key (X9.62) to `/register`, and gets the server's back. Both sides do the math independently:
