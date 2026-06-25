@@ -239,4 +239,4 @@ This builds on a few open-source projects worth calling out:
 
 **[TrustedSec](https://github.com/trustedsec)** — the base COFFLoader and the broader BOF design 
 
-**[Havoc C2](https://github.com/HavocFramework/Havoc)** — the wire protocol framing, the command ID layout, and the batch-package idea were all influenced by Havoc's agent-server design.
+**[Havoc C2](https://github.com/HavocFramework/Havoc)** — the wire protocol framing, the command ID layout, and the batch-package idea are all Havoc's with very slight differences.
