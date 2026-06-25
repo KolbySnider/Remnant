@@ -65,9 +65,6 @@ Tasks move through a typed queue, not raw command strings:
 4. The beacon dispatches by command ID. BOFs go directly to the COFFLoader with the pre-packed argument buffer.
 5. Output lands in a thread-safe buffer and ships out on the following checkin as a `PKG_CMD_TASK_OUTPUT` package, correlated to the original task via `request_id`.
 
-### Persistent agent state
-
-Agent sessions — session key, task history, output, stats — get serialized to `agents.json` and reloaded on restart. You can kill and bring the server back without losing active sessions, as long as the beacon reconnects within its retry window.
 ---
 
 ## Requirements
