@@ -8,7 +8,7 @@ A small C2 framework. Python server with an interactive CLI, Windows beacon in C
 
 ---
 
-## What's in it
+## Features
 
 ### Custom binary protocol
 
