@@ -226,7 +226,7 @@ The server packs these in BeaconPack format before embedding them in the task pa
 
 ### Writing your own
 
-BOFs are standard COFF objects compiled with `gcc -c`. They export `go(char *args, int len)` and use the `BeaconData*` API to parse arguments and `BeaconPrintf` / `BeaconOutput` to produce output. Drop the compiled `.obj` into `server/bofs/` and it's available via `bof` immediately.
+BOFs are standard COFF objects compiled with `gcc -c`. They export `go(char *args, int len)` and use the `BeaconData*` API to parse arguments and `BeaconPrintf` / `BeaconOutput` to produce output. Drop the compiled `.obj` into `server/bofs/` and it's available via `bof` immediately. Make sure to `#include "base.h"` for the Win32 declarations or else the COFFLoader will not be able to resolve the symbol at load time.
 
 ```c
 #include "base.h"
@@ -256,6 +256,6 @@ void go(char *args, int len) {
 
 This builds on a few open-source projects worth calling out:
 
-**[TrustedSec](https://github.com/trustedsec)** — the COFFLoader and the broader BOF design 
+**[TrustedSec](https://github.com/trustedsec)** — the base COFFLoader and the broader BOF design 
 
 **[Havoc C2](https://github.com/HavocFramework/Havoc)** — the wire protocol framing, the command ID layout, and the batch-package idea were all influenced by Havoc's agent-server design.
