@@ -17,6 +17,9 @@
 #define TAG_LEN    16
 #define KEY_LEN    32   /* AES-256 */
 
+//TODO: Implement dynamic API resolution like in COFFLoader.c however i'm lazy
+
+
 /**
  * @brief Open the BCrypt AES provider in GCM mode and import SESSION_KEY.
  *        pbKeyObject must stay alive for the lifetime of hKey;

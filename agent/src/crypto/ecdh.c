@@ -10,6 +10,9 @@
 
 uint8_t SESSION_KEY[32] = {0};
 
+//TODO: Implement dynamic API resolution like in COFFLoader.c however i'm lazy
+
+
 void gen_random_bytes(uint8_t *buf, size_t len) {
     BCRYPT_ALG_HANDLE hAlg;
     if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_RNG_ALGORITHM, NULL, 0) == 0) {

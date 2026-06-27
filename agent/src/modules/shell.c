@@ -9,6 +9,9 @@
 #include "loader/beacon_compatibility.h"
 #include "config.h"
 
+//TODO: Implement dynamic API resolution like in COFFLoader.c however i'm lazy
+
+
 #define OUTPUT_BUF_SIZE  (256 * 1024)
 #define CMD_BUF_SIZE     4096
 

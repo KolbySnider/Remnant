@@ -11,6 +11,8 @@
 #define HTTP_BUF_SIZE  (512 * 1024)
 #define PATH_BUF_SIZE  512
 
+//TODO: Implement dynamic API resolution like in COFFLoader.c however i'm lazy
+
 /**
  * @brief Perform an HTTP(S) POST via WinHTTP.
  * @param host         Server hostname or IP.
