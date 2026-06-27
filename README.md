@@ -71,7 +71,7 @@ Prerequisite on whatever machine runs the server:
 
 ```
  > generate [--ip IP] [--port PORT] [--ua USER_AGENT] [--token AUTH_TOKEN]
-            [--sleep MS] [--jitter MS] [--https] [--out filename.exe]
+            [--sleep MS] [--jitter MS] [--https] [--dll] [--out filename.exe]
 ```
 
 All flags optional. Defaults come from the server's own listen config and auth token.
@@ -85,6 +85,7 @@ All flags optional. Defaults come from the server's own listen config and auth t
 | `--sleep` | `5000` | Base checkin interval, ms |
 | `--jitter` | `3000` | Symmetric jitter, ms |
 | `--https` | off | Use HTTPS (cert validation is disabled) |
+| `--dll` | `.exe` | decides if beacon is `.dll` or `.exe` |
 | `--out` | `beacon.exe` | Output filename under `agent/build/` |
 
 ### Examples
