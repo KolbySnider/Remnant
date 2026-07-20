@@ -93,6 +93,9 @@ int execute_bof(unsigned char *bof_data, size_t bof_size, char *args, int args_l
         free(bof_output);
     }
 
+    if (result != COFF_SUCCESS)
+        BeaconPrintf(CALLBACK_ERROR, "[BOF] load/run failed: %s", CoffErrorString(result));
+
     return (result == COFF_SUCCESS) ? 0 : 1;
 }
 

@@ -32,6 +32,11 @@ class BeaconPack:
         self.buffer += pack(fmt, len(s)+2, s)
         self.size += calcsize(fmt)
 
+    def addbin(self, data: bytes):
+        fmt = "<L{}s".format(len(data))
+        self.buffer += pack(fmt, len(data), data)
+        self.size += calcsize(fmt)
+
 class MainLoop(cmd.Cmd):
     def __init__(self):
         cmd.Cmd.__init__(self)

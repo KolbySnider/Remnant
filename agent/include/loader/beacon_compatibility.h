@@ -166,6 +166,7 @@
 #define Kernel32$OpenThread                OpenThread
 #define Kernel32$TerminateThread           TerminateThread
 #define Kernel32$CreateThread              CreateThread
+#define Kernel32$CreateRemoteThread        CreateRemoteThread
 #define Kernel32$WaitForSingleObject       WaitForSingleObject
 #define Kernel32$WaitForMultipleObjects    WaitForMultipleObjects
 #define Kernel32$Sleep                     Sleep
@@ -272,6 +273,7 @@
 #define KERNEL32$OpenThread                Kernel32$OpenThread
 #define KERNEL32$TerminateThread           Kernel32$TerminateThread
 #define KERNEL32$CreateThread              Kernel32$CreateThread
+#define KERNEL32$CreateRemoteThread        Kernel32$CreateRemoteThread
 #define KERNEL32$WaitForSingleObject       Kernel32$WaitForSingleObject
 #define KERNEL32$WaitForMultipleObjects    Kernel32$WaitForMultipleObjects
 #define KERNEL32$Sleep                     Kernel32$Sleep

