@@ -227,10 +227,8 @@ void go(char *args, int len) {
 ```
 ## TODO (maybe)
 1. Indirect syscalls: help with not being detected by userland hooks
-2. Sleep obfuscation: Implement either ekko or foliage sleep or an adhoc version of both
-3. Persistence: Should be easy enough to add just lazy
-4. Token manipulation
-5. process injection
+2. Persistence: Should be easy enough to add just lazy
+3. Token manipulation
 
 ---
 
